@@ -47,6 +47,7 @@ _ap.add_argument("--no-ghost", action="store_true", help="do not seat the ghost 
 _ap.add_argument("--godmode", action="store_true", help="full heal 5x/s + damage shield + damage-cut buffs on every unit")
 _ap.add_argument("--atkbuff", action="store_true", help="+225%% attack buffs (curse-of-emptiness immune)")
 _ap.add_argument("--cleanse", action="store_true", help="remove every debuff an enemy puts on your units (implied by --godmode)")
+_ap.add_argument("--spfill", action="store_true", help="refill every unit's skill gauges (SP) to 100%% once a second")
 _ap.add_argument("--cheat", type=float, default=1.0, help="(ineffective, kept for experiments) scale HeroParam hp/attack")
 _ap.add_argument("--log", default=os.path.join(HERE, "photon_lite.log"), help="log file")
 _ARGS = _ap.parse_args()
@@ -74,6 +75,20 @@ DP_HITATTR_INDEX = 7499
 # _EnhancedSkill*/_EnhancedBurstAttack (e.g. condition 853): they replace the units' skills and freeze the game.
 ATK_BUFF_HITATTR_INDEXES = [6579, 5408, 73, 8608, 5458] if _ARGS.atkbuff else []
 EV_RECOVERY_HP_REQUEST = 76
+# --spfill: RecoverySpRequest (74) = [seq, character[actor,idx], healRatio, healSkillIndex, isHumanOnly, healValue,
+# isDragonOnly] (RecoverySpRequestFormatter.Serialize). The owner (MultiPlayManager.OnEvent case 74, HasMultiPlayOwner)
+# calls CharacterBase.RecoverySpRatio(ratio, index, ...): index 0 = every skill, SP += ceil(consumeSp * ratio)
+# (CharacterBase.RecoverySp -> ApplySpGainCut -> SetSp), i.e. ratio 1.0 fills all skills of the current form.
+SPFILL = _ARGS.spfill
+EV_RECOVERY_SP_REQUEST = 74
+SP_INTERVAL = 1.0
+# Diagnostic variants (2026-08-31: the ratio event alone showed "no change" on the phone): the fixed-value branch of
+# the same handler (healRatio 0 -> RecoverySp(healValue, i) for every skill) and a HEAL_SP hit attribute through the
+# proven RecoveryHpRequest channel (BUF_138_SP_LV03, index 280: _HitExecType 7, _RecoverySpRatio 1.0, skill index 0).
+SP_HITATTR_INDEX = 280
+# Party-switch quests: the second team's units are CharacterId index 40+i (client CharacterId.LatterPartyIndexOffset = 40;
+# ServantIndexOffset 20, GuestPlayerIndexOffset 100). Every per-unit cheat targets all parties, or team 2 gets nothing.
+LATTER_PARTY_INDEX_OFFSET = 40
 EV_REBORN = 27
 REBORN_DELAY = 0.4
 # --cleanse: the client broadcasts every condition applied to its units as ChangeBuff (50); entries whose `from`
@@ -451,7 +466,7 @@ class Peer:
 
     def send_event(self, evcode, params):
         body = bytes([evcode]) + params_encode(params)
-        if evcode != EV_RECOVERY_HP_REQUEST:   # the god-mode loop is too chatty to log every tick
+        if evcode not in (EV_RECOVERY_HP_REQUEST, EV_RECOVERY_SP_REQUEST):   # the god-mode loop is too chatty to log every tick
             log(f"{self.tag()} <- Event {evcode} {fmt_params(params)}")
         self.send_reliable(0, b"\xf3\x04" + body)
 
@@ -720,28 +735,46 @@ class Peer:
         self.raise_plugin_event(EV_REBORN, evt)
 
     def god_loop(self):
-        """--godmode: keep every host unit at full HP with RecoveryHpRequest events (owner applies them)."""
+        """--godmode / --spfill: keep every host unit at full HP (RecoveryHpRequest) and/or full SP (RecoverySpRequest);
+        the owning client applies both to the units it owns."""
         time.sleep(4.0)  # let the units spawn
         units = self.used_member_count(1) or 1
-        log(f"{self.tag()} GODMODE: healing {units} unit(s) every {GOD_INTERVAL}s (hitattr index {HEAL_HITATTR_INDEX})")
+        parties = max(1, max((len(h["lists"]) for h in self.hero.values()), default=1))
+        targets = [p * LATTER_PARTY_INDEX_OFFSET + i for p in range(parties) for i in range(units)]
+        if GODMODE:
+            log(f"{self.tag()} GODMODE: healing units {targets} every {GOD_INTERVAL}s (hitattr index {HEAL_HITATTR_INDEX})")
+        if SPFILL:
+            log(f"{self.tag()} SPFILL: refilling every skill of units {targets} every {SP_INTERVAL}s")
         n = 0
         shield_every = max(1, int(round(SHIELD_INTERVAL / GOD_INTERVAL)))
+        sp_every = max(1, int(round(SP_INTERVAL / GOD_INTERVAL)))
         while self.in_quest and self.state in ("joined",) and n < 7200:
-            for i in range(units):
-                # RecoveryHpRequest: [seq, character[actorId,index], from[actorId,index], healValue, characterType,
-                #                     elementIndex, actionId, productId, bulletId, skillId, followerAvoid]
-                evt = [self.next_ev_seq(EV_RECOVERY_HP_REQUEST), [1, i], [1, i], 999999, 0, HEAL_HITATTR_INDEX, 0, 0, 0, 0, 0]
+            for i in targets:
                 try:
-                    self.send_event(EV_RECOVERY_HP_REQUEST, {245: mp_pack(evt), 254: 0})
-                    if n % shield_every == 0:   # shield + damage-cut + attack buffs via the hit attributes' ActionCondition
-                        for idx in BUFF_HITATTR_INDEXES + ATK_BUFF_HITATTR_INDEXES + [DP_HITATTR_INDEX]:
-                            evt = [self.next_ev_seq(EV_RECOVERY_HP_REQUEST), [1, i], [1, i], 1, 0, idx, 0, 0, 0, 0, 0]
-                            self.send_event(EV_RECOVERY_HP_REQUEST, {245: mp_pack(evt), 254: 0})
+                    if GODMODE:
+                        # RecoveryHpRequest: [seq, character[actorId,index], from[actorId,index], healValue, characterType,
+                        #                     elementIndex, actionId, productId, bulletId, skillId, followerAvoid]
+                        evt = [self.next_ev_seq(EV_RECOVERY_HP_REQUEST), [1, i], [1, i], 999999, 0, HEAL_HITATTR_INDEX, 0, 0, 0, 0, 0]
+                        self.send_event(EV_RECOVERY_HP_REQUEST, {245: mp_pack(evt), 254: 0})
+                        if n % shield_every == 0:   # shield + damage-cut + attack buffs via the hit attributes' ActionCondition
+                            for idx in BUFF_HITATTR_INDEXES + ATK_BUFF_HITATTR_INDEXES + [DP_HITATTR_INDEX]:
+                                evt = [self.next_ev_seq(EV_RECOVERY_HP_REQUEST), [1, i], [1, i], 1, 0, idx, 0, 0, 0, 0, 0]
+                                self.send_event(EV_RECOVERY_HP_REQUEST, {245: mp_pack(evt), 254: 0})
+                    if SPFILL and n % sp_every == 0:
+                        # RecoverySpRequest: [seq, character, healRatio, healSkillIndex (0 = all), isHumanOnly, healValue, isDragonOnly]
+                        evt = [self.next_ev_seq(EV_RECOVERY_SP_REQUEST), [1, i], 1.0, 0, False, 0, False]
+                        if n == 0 and i == 0:
+                            log(f"{self.tag()} SPFILL first event bytes: {mp_pack(evt).hex()}")
+                        self.send_event(EV_RECOVERY_SP_REQUEST, {245: mp_pack(evt), 254: 0})
+                        evt = [self.next_ev_seq(EV_RECOVERY_SP_REQUEST), [1, i], 0.0, 0, False, 99999, False]
+                        self.send_event(EV_RECOVERY_SP_REQUEST, {245: mp_pack(evt), 254: 0})
+                        evt = [self.next_ev_seq(EV_RECOVERY_HP_REQUEST), [1, i], [1, i], 1, 0, SP_HITATTR_INDEX, 0, 0, 0, 0, 0]
+                        self.send_event(EV_RECOVERY_HP_REQUEST, {245: mp_pack(evt), 254: 0})
                 except Exception:  # noqa: BLE001
                     log(f"{self.tag()} godmode send error:\n{traceback.format_exc()}"); return
             n += 1
             time.sleep(GOD_INTERVAL)
-        log(f"{self.tag()} GODMODE loop ended (in_quest={self.in_quest}, state={self.state}, ticks={n})")
+        log(f"{self.tag()} GODMODE/SPFILL loop ended (in_quest={self.in_quest}, state={self.state}, ticks={n})")
 
     def quest_id(self):
         return int(self.game_props.get("C0", 0))
@@ -884,7 +917,7 @@ class Peer:
             log(f"{self.tag()} actor 1 ready -> StartQuest")
             self.raise_plugin_event(EV_START_QUEST, {})
             self.start_actor_count = 1
-            if GODMODE and not self.in_quest:      # the client sends Ready more than once; one loop per quest
+            if (GODMODE or SPFILL) and not self.in_quest:      # the client sends Ready more than once; one loop per quest
                 self.in_quest = True
                 threading.Thread(target=self.god_loop, daemon=True).start()
             self.in_quest = True
