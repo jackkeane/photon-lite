@@ -826,7 +826,12 @@ class Peer:
                 evt = [1, a, params, [], exs]
                 self.raise_plugin_event(EV_CHARACTER_DATA, evt)
         if self.ghost_props is not None:
-            self.raise_plugin_event(EV_CHARACTER_DATA, [1, GHOST_ACTOR, [], [], []])
+            # party-switch quests (_DungeonType 15, e.g. Diabolos/天魔) need one CharacterData per party for EVERY
+            # actor: CharacterManager.LoadPlayers indexes otherCharacters[actor][partySwitchIndex] — one empty entry
+            # for a 2-party quest hangs the loading coroutine. Mirror the host's party count.
+            parties = max(1, max((len(h["lists"]) for h in self.hero.values()), default=1))
+            for _ in range(parties):
+                self.raise_plugin_event(EV_CHARACTER_DATA, [1, GHOST_ACTOR, [], [], []])
 
     def on_client_event(self, code, data):
         if code == EV_READY:
