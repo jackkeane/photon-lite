@@ -46,6 +46,7 @@ _ap.add_argument("--fill", type=int, default=4, help="units a lone player contro
 _ap.add_argument("--no-ghost", action="store_true", help="do not seat the ghost second player (start button stays grey alone)")
 _ap.add_argument("--godmode", action="store_true", help="full heal 5x/s + damage shield + damage-cut buffs on every unit")
 _ap.add_argument("--atkbuff", action="store_true", help="+225%% attack buffs (curse-of-emptiness immune)")
+_ap.add_argument("--cleanse", action="store_true", help="remove every debuff an enemy puts on your units (implied by --godmode)")
 _ap.add_argument("--cheat", type=float, default=1.0, help="(ineffective, kept for experiments) scale HeroParam hp/attack")
 _ap.add_argument("--log", default=os.path.join(HERE, "photon_lite.log"), help="log file")
 _ARGS = _ap.parse_args()
@@ -66,12 +67,25 @@ HEAL_HITATTR_INDEX = 226   # BUF_127_HEAL_LV01 -- index into the 2.19.0 client's
 SHIELD_HITATTR_INDEX = 8252  # S169_001_02_LV02 -> ActionCondition 2065: damage shield 100% max HP (2 charges)
 SHIELD_INTERVAL = 1.0
 BUFF_HITATTR_INDEXES = [SHIELD_HITATTR_INDEX, 439, 438, 5567, 5566]   # 70%/70%/60%/50% damage-cut buffs
+# Dragon-gauge refill: S053_001_DPC_LV02 (index 7499) = +20% dragon points to self each application, so a boss that
+# drains the gauge (Diabolos 背德祝福) cannot keep the party from shapeshifting. Applied with the buffs every second.
+DP_HITATTR_INDEX = 7499
 # +100/+50/+50/+15/+10% attack, all _CurseOfEmptinessInvalid. NEVER add rows whose ActionCondition carries
 # _EnhancedSkill*/_EnhancedBurstAttack (e.g. condition 853): they replace the units' skills and freeze the game.
 ATK_BUFF_HITATTR_INDEXES = [6579, 5408, 73, 8608, 5458] if _ARGS.atkbuff else []
 EV_RECOVERY_HP_REQUEST = 76
 EV_REBORN = 27
 REBORN_DELAY = 0.4
+# --cleanse: the client broadcasts every condition applied to its units as ChangeBuff (50); entries whose `from`
+# actor is -1 (an enemy) / hitTargetGroup 3 are debuffs -> answer with ResetBuffRequest (75), which the owner applies
+# (MultiPlayManager.OnEvent case 75 @0x1DD2FD8 -> HasMultiPlayOwner -> CharacterBuff.ResetBuffDebuffByConditionId).
+CLEANSE = _ARGS.cleanse or _ARGS.godmode
+EV_CHANGE_BUFF = 50
+EV_RESET_BUFF_REQUEST = 75
+# Party-switch quests: at each phase the host raises GameStepEvent (96, [seq, step]) and MultiPlayWaitingList
+# .StartWaitForAllOthers waits for the same step from every other actor (PartySwitchTimeout after ~10 s otherwise).
+# The ghost echoes each step as its own event (sender = ghost actor).
+EV_GAME_STEP = 96
 
 
 def now_ms():
@@ -93,7 +107,7 @@ REPLAY_TIMEOUT_SECONDS = 30
 EV_READY, EV_CHARACTER_DATA, EV_START_QUEST, EV_ROOM_BROKEN, EV_GAME_SUCCEED = 0x03, 0x14, 0x15, 0x17, 0x18
 EV_PARTY, EV_CLEAR_REQ, EV_CLEAR_RESP, EV_FAIL_REQ, EV_FAIL_RESP, EV_DEAD = 0x3E, 0x3F, 0x40, 0x43, 0x44, 0x48
 EV_NAMES = {3: "Ready", 0x14: "CharacterData", 0x15: "StartQuest", 0x17: "RoomBroken", 0x18: "GameSucceed", 0x3E: "Party",
-            27: "RebornEvent", 76: "RecoveryHpRequest",
+            27: "RebornEvent", 76: "RecoveryHpRequest", 61: "DragonGauge", 71: "EnemyAbility", 50: "ChangeBuff", 75: "ResetBuffRequest",
             0x3F: "ClearQuestRequest", 0x40: "ClearQuestResponse", 0x43: "FailQuestRequest", 0x44: "FailQuestResponse",
             0x48: "Dead", 253: "PropertiesChanged", 255: "Join", 254: "Leave"}
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -640,11 +654,19 @@ class Peer:
         if opcode == 253:  # RaiseEvent -- no response unless error; plugin hooks on a few codes
             code = int(params.get(244, -1))
             data = params.get(245)
-            if code == 50 and isinstance(data, (bytes, bytearray)):   # ChangeBuff: show which buffs the client applies
+            if code == EV_CHANGE_BUFF and isinstance(data, (bytes, bytearray)):   # ChangeBuff: buffs/debuffs on a unit
                 try:
-                    log(f"{self.tag()} -> client event 50(ChangeBuff) {mp_unpack(data)}")
+                    cb = mp_unpack(data)
+                    log(f"{self.tag()} -> client event 50(ChangeBuff) {cb}")
+                    if CLEANSE and self.in_quest:
+                        self.cleanse_from_changebuff(cb)
                 except Exception:  # noqa: BLE001
                     log(f"{self.tag()} -> client event 50(ChangeBuff) raw={bytes(data).hex()}")
+            elif code in (61, 71) and isinstance(data, (bytes, bytearray)):   # DragonGauge / EnemyAbility: decode for diagnosis
+                try:
+                    log(f"{self.tag()} -> client event {code}({EV_NAMES.get(code, '?')}) {mp_unpack(data)}")
+                except Exception:  # noqa: BLE001
+                    log(f"{self.tag()} -> client event {code} raw={bytes(data).hex()}")
             elif code not in (12, 13, 17, 31, 65, 86, 99, 111, 10, 57, 85, 49):   # movement/state spam
                 log(f"{self.tag()} -> client event {code}({EV_NAMES.get(code, '?')}) data={len(data) if isinstance(data, (bytes, bytearray)) else data}")
             try:
@@ -666,6 +688,29 @@ class Peer:
     def next_ev_seq(self, code):
         self.ev_seq[code] = (self.ev_seq.get(code, 0) % 65535) + 1
         return self.ev_seq[code]
+
+    def cleanse_from_changebuff(self, cb):
+        """ChangeBuff = [seq, character[actor,idx], addParameters[[multiPlayKey, type, conditionId, durationSec,
+        durationNum, skillId, actionId, abilityId, productId, rate, hitTargetGroup, from[actor,idx], ...]], ...]"""
+        if not isinstance(cb, list) or len(cb) < 3 or not isinstance(cb[1], list):
+            return
+        character = [int(cb[1][0]), int(cb[1][1])]
+        if character[0] != 1:
+            return
+        found = []
+        for p in cb[2] or []:          # addParameters: [key, type, conditionId, dur, num, skill, action, ability, product, rate, group, from, ...]
+            if isinstance(p, list) and len(p) >= 12:
+                found.append((int(p[2]), int(p[7]), int(p[8]), int(p[10]), p[11]))
+        if len(cb) > 8:
+            for p in cb[8] or []:      # addUnifiedParameters: [key, conditionId, dur, num, skill, action, ability, product, group, from, ...]
+                if isinstance(p, list) and len(p) >= 10:
+                    found.append((int(p[1]), int(p[6]), int(p[7]), int(p[8]), p[9]))
+        for cond, ability_id, product_id, group, frm in found:
+            from_actor = int(frm[0]) if isinstance(frm, list) and frm else 0
+            if from_actor == -1 or group == 3:
+                evt = [self.next_ev_seq(EV_RESET_BUFF_REQUEST), character, cond, ability_id, product_id]
+                log(f"{self.tag()} CLEANSE: removing condition {cond} (from actor {from_actor}, group {group}) on unit {character}")
+                self.raise_plugin_event(EV_RESET_BUFF_REQUEST, evt)
 
     def send_reborn(self, targets):
         if not self.in_quest:
@@ -689,7 +734,7 @@ class Peer:
                 try:
                     self.send_event(EV_RECOVERY_HP_REQUEST, {245: mp_pack(evt), 254: 0})
                     if n % shield_every == 0:   # shield + damage-cut + attack buffs via the hit attributes' ActionCondition
-                        for idx in BUFF_HITATTR_INDEXES + ATK_BUFF_HITATTR_INDEXES:
+                        for idx in BUFF_HITATTR_INDEXES + ATK_BUFF_HITATTR_INDEXES + [DP_HITATTR_INDEX]:
                             evt = [self.next_ev_seq(EV_RECOVERY_HP_REQUEST), [1, i], [1, i], 1, 0, idx, 0, 0, 0, 0, 0]
                             self.send_event(EV_RECOVERY_HP_REQUEST, {245: mp_pack(evt), 254: 0})
                 except Exception:  # noqa: BLE001
@@ -889,6 +934,15 @@ class Peer:
             # lone player: "all dead" or fewer actors than at start -> back to lobby
             self.set_game_props({"GoToIngameInfo": None, "RoomId": -1})
             self.reset_state_machine()
+        elif code == EV_GAME_STEP:
+            if self.ghost_props is not None:
+                try:
+                    step = mp_unpack(data)       # [seq, step]
+                    log(f"{self.tag()} GameStepEvent from host {step} -> ghost echoes it")
+                    evt = [self.next_ev_seq(EV_GAME_STEP)] + (list(step[1:]) if isinstance(step, list) else [step])
+                    self.send_event(EV_GAME_STEP, {245: mp_pack(evt), 254: GHOST_ACTOR})
+                except Exception:  # noqa: BLE001
+                    log(f"{self.tag()} GameStepEvent echo error:\n{traceback.format_exc()}")
         elif code == EV_DEAD:
             self.dead.add(1)
             if GODMODE and self.in_quest:
@@ -897,7 +951,7 @@ class Peer:
                     target = d[1] if isinstance(d, list) and len(d) > 1 else None
                 except Exception:  # noqa: BLE001
                     target = None
-                if isinstance(target, list) and len(target) >= 2:
+                if isinstance(target, list) and len(target) >= 2 and int(target[0]) == 1:   # own units only, not enemies
                     threading.Timer(REBORN_DELAY, self.send_reborn, args=([list(target[:2])],)).start()
         elif code == EV_REBORN and GODMODE and self.in_quest:
             try:
