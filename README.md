@@ -75,10 +75,12 @@ verified on a real phone. Rooms with a second device are **not** implemented (se
 | `--token` | `photon-lite-token` | must equal `PhotonOptions__Token` |
 | `--fill N` | 4 | units a lone player controls in a normal co-op room |
 | `--no-ghost` | off | don't seat the ghost second player (normal rooms then can't be started alone) |
-| `--godmode` | off | heal every unit 5×/s + 100 %-of-max-HP damage shield + damage-cut buffs every second |
-| `--atkbuff` | off | five plain attack-up buffs (+225 % if they stack), refreshed every second |
-| `--cleanse` | off (on with `--godmode`) | remove every condition an enemy puts on your units as soon as the client reports it |
+| `--godmode` | off | heal every unit 2.5×/s + 100 %-of-max-HP damage shield + damage-cut buffs every 2 s (staggered across ticks to keep the event load smooth) |
+| `--atkbuff` | off | five plain attack-up buffs (+225 % if they stack), refreshed with the god-mode volley |
+| `--cleanse` | off (on with `--godmode`) | remove every condition an enemy puts on your units — sent three times (now / +0.7 s / +2 s) because the player-controlled unit only accepts the removal on a delayed retry |
+| `--no-cleanse` | off | disable the cleanse even with `--godmode` (A/B testing) |
 | `--spfill` | off | refill every unit's skill gauges (SP) to 100 % once a second |
+| `--log-buffs` | off | decode-log every ChangeBuff event (multi-KB lines — heavy in busy fights) |
 
 ## Limits
 
@@ -88,7 +90,8 @@ verified on a real phone. Rooms with a second device are **not** implemented (se
   multi-hit chain can still kill. Auto-revive only works in quests whose `_RebornLimit` allows revives
   (normal co-op quests do; most raids don't).
 * `--cleanse` cannot remove conditions the game marks as reset-proof (Curse of Emptiness / "nihil",
-  and the Lock-On marker); everything else, including shapeshift-blocking seals, goes away.
+  and the Lock-On marker — the stub skips those to save event traffic); everything else, including
+  shapeshift-blocking seals like Demonic Judgment, goes away within a couple of seconds.
 * Scaling `hp`/`attack` in the HeroParam data does nothing — the client derives unit stats from master
   data + level (`--cheat` is kept only for experiments).
 * No random matching with strangers, no room lists across servers.
