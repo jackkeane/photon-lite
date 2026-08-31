@@ -76,16 +76,16 @@ DP_HITATTR_INDEX = 7499
 ATK_BUFF_HITATTR_INDEXES = [6579, 5408, 73, 8608, 5458] if _ARGS.atkbuff else []
 EV_RECOVERY_HP_REQUEST = 76
 # --spfill: RecoverySpRequest (74) = [seq, character[actor,idx], healRatio, healSkillIndex, isHumanOnly, healValue,
-# isDragonOnly] (RecoverySpRequestFormatter.Serialize). The owner (MultiPlayManager.OnEvent case 74, HasMultiPlayOwner)
-# calls CharacterBase.RecoverySpRatio(ratio, index, ...): index 0 = every skill, SP += ceil(consumeSp * ratio)
-# (CharacterBase.RecoverySp -> ApplySpGainCut -> SetSp), i.e. ratio 1.0 fills all skills of the current form.
+# isDragonOnly] (RecoverySpRequestFormatter.Serialize @0x24337AC, wire order byte-verified). The owner
+# (MultiPlayManager.OnEvent case 74, HasMultiPlayOwner) branches on Mathf.Approximately(0, healRatio): ratio != 0 ->
+# virtual RecoverySpRatio (every skill of the current form gains ceil(consumeSp * ratio)); ratio ~0 ->
+# CharacterBase.RecoverySp(healValue, i) per skill, clamped to max. BOTH forms are sent back-to-back each tick because
+# a phone bisect (2026-08-31, 5 runs) found NEITHER form fills anything alone, yet the pair does — an unexplained
+# client-side coupling, reproduced twice. A HEAL_SP hit attribute (280) via RecoveryHpRequest was also tried: inert
+# alone and dead weight in the triple, so it was dropped. Details: photon-research README.txt "SPFILL".
 SPFILL = _ARGS.spfill
 EV_RECOVERY_SP_REQUEST = 74
 SP_INTERVAL = 1.0
-# Diagnostic variants (2026-08-31: the ratio event alone showed "no change" on the phone): the fixed-value branch of
-# the same handler (healRatio 0 -> RecoverySp(healValue, i) for every skill) and a HEAL_SP hit attribute through the
-# proven RecoveryHpRequest channel (BUF_138_SP_LV03, index 280: _HitExecType 7, _RecoverySpRatio 1.0, skill index 0).
-SP_HITATTR_INDEX = 280
 # Party-switch quests: the second team's units are CharacterId index 40+i (client CharacterId.LatterPartyIndexOffset = 40;
 # ServantIndexOffset 20, GuestPlayerIndexOffset 100). Every per-unit cheat targets all parties, or team 2 gets nothing.
 LATTER_PARTY_INDEX_OFFSET = 40
@@ -762,14 +762,11 @@ class Peer:
                                 self.send_event(EV_RECOVERY_HP_REQUEST, {245: mp_pack(evt), 254: 0})
                     if SPFILL and n % sp_every == 0:
                         # RecoverySpRequest: [seq, character, healRatio, healSkillIndex (0 = all), isHumanOnly, healValue, isDragonOnly]
+                        # both forms are required — neither fills alone (see the SPFILL constants block above)
                         evt = [self.next_ev_seq(EV_RECOVERY_SP_REQUEST), [1, i], 1.0, 0, False, 0, False]
-                        if n == 0 and i == 0:
-                            log(f"{self.tag()} SPFILL first event bytes: {mp_pack(evt).hex()}")
                         self.send_event(EV_RECOVERY_SP_REQUEST, {245: mp_pack(evt), 254: 0})
                         evt = [self.next_ev_seq(EV_RECOVERY_SP_REQUEST), [1, i], 0.0, 0, False, 99999, False]
                         self.send_event(EV_RECOVERY_SP_REQUEST, {245: mp_pack(evt), 254: 0})
-                        evt = [self.next_ev_seq(EV_RECOVERY_HP_REQUEST), [1, i], [1, i], 1, 0, SP_HITATTR_INDEX, 0, 0, 0, 0, 0]
-                        self.send_event(EV_RECOVERY_HP_REQUEST, {245: mp_pack(evt), 254: 0})
                 except Exception:  # noqa: BLE001
                     log(f"{self.tag()} godmode send error:\n{traceback.format_exc()}"); return
             n += 1
