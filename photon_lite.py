@@ -47,6 +47,8 @@ _ap.add_argument("--no-ghost", action="store_true", help="do not seat the ghost 
 _ap.add_argument("--godmode", action="store_true", help="full heal 5x/s + damage shield + damage-cut buffs on every unit")
 _ap.add_argument("--atkbuff", action="store_true", help="+225%% attack buffs (curse-of-emptiness immune)")
 _ap.add_argument("--cleanse", action="store_true", help="remove every debuff an enemy puts on your units (implied by --godmode)")
+_ap.add_argument("--no-cleanse", action="store_true", help="disable the cleanse even with --godmode (A/B testing)")
+_ap.add_argument("--log-buffs", action="store_true", help="decode-log every ChangeBuff event (multi-KB lines; off by default since 2026-08-31 — the writes stall the relay loop in busy fights)")
 _ap.add_argument("--spfill", action="store_true", help="refill every unit's skill gauges (SP) to 100%% once a second")
 _ap.add_argument("--cheat", type=float, default=1.0, help="(ineffective, kept for experiments) scale HeroParam hp/attack")
 _ap.add_argument("--log", default=os.path.join(HERE, "photon_lite.log"), help="log file")
@@ -66,7 +68,7 @@ GODMODE = _ARGS.godmode
 GOD_INTERVAL = 0.2
 HEAL_HITATTR_INDEX = 226   # BUF_127_HEAL_LV01 -- index into the 2.19.0 client's PlayerActionHitAttribute master list
 SHIELD_HITATTR_INDEX = 8252  # S169_001_02_LV02 -> ActionCondition 2065: damage shield 100% max HP (2 charges)
-SHIELD_INTERVAL = 1.0
+BUFF_PERIOD = 2.0            # how often each unit's shield/cut/attack-buff volley refreshes (staggered, one unit per tick)
 BUFF_HITATTR_INDEXES = [SHIELD_HITATTR_INDEX, 439, 438, 5567, 5566]   # 70%/70%/60%/50% damage-cut buffs
 # Dragon-gauge refill: S053_001_DPC_LV02 (index 7499) = +20% dragon points to self each application, so a boss that
 # drains the gauge (Diabolos 背德祝福) cannot keep the party from shapeshifting. Applied with the buffs every second.
@@ -94,9 +96,14 @@ REBORN_DELAY = 0.4
 # --cleanse: the client broadcasts every condition applied to its units as ChangeBuff (50); entries whose `from`
 # actor is -1 (an enemy) / hitTargetGroup 3 are debuffs -> answer with ResetBuffRequest (75), which the owner applies
 # (MultiPlayManager.OnEvent case 75 @0x1DD2FD8 -> HasMultiPlayOwner -> CharacterBuff.ResetBuffDebuffByConditionId).
-CLEANSE = _ARGS.cleanse or _ARGS.godmode
+CLEANSE = (_ARGS.cleanse or _ARGS.godmode) and not _ARGS.no_cleanse
+LOG_BUFFS = _ARGS.log_buffs
 EV_CHANGE_BUFF = 50
 EV_RESET_BUFF_REQUEST = 75
+# Conditions that resist ResetBuffRequest by design (虛無/nihil 1599, 標的/lock-on 1671): resets for them are pure
+# event-channel load and never remove anything, so cleanse skips them (2026-08-31 slowdown fix — the Diabolos AoE
+# applies 3 conditions per unit at once and only 惡魔審判 1989 is actually removable).
+CLEANSE_SKIP_CONDITIONS = {1599, 1671}
 # Party-switch quests: at each phase the host raises GameStepEvent (96, [seq, step]) and MultiPlayWaitingList
 # .StartWaitForAllOthers waits for the same step from every other actor (PartySwitchTimeout after ~10 s otherwise).
 # The ghost echoes each step as its own event (sender = ghost actor).
@@ -403,6 +410,7 @@ class Peer:
         self.lock = threading.RLock()   # send path is used from the UDP thread and the god-mode thread
         self.in_quest = False
         self.ev_seq = {}                # event code -> running _raiseEventSequenceId
+        self.cleanse_recent = {}        # (unit tuple, conditionId) -> time of the last cleanse volley (dedupe)
 
     def tag(self):
         return f"[{self.server.role}:{self.addr[0]}:{self.addr[1]}]"
@@ -466,7 +474,7 @@ class Peer:
 
     def send_event(self, evcode, params):
         body = bytes([evcode]) + params_encode(params)
-        if evcode not in (EV_RECOVERY_HP_REQUEST, EV_RECOVERY_SP_REQUEST):   # the god-mode loop is too chatty to log every tick
+        if evcode not in (EV_RECOVERY_HP_REQUEST, EV_RECOVERY_SP_REQUEST, EV_RESET_BUFF_REQUEST):   # god-mode/cleanse loops are too chatty to log every send
             log(f"{self.tag()} <- Event {evcode} {fmt_params(params)}")
         self.send_reliable(0, b"\xf3\x04" + body)
 
@@ -672,7 +680,8 @@ class Peer:
             if code == EV_CHANGE_BUFF and isinstance(data, (bytes, bytearray)):   # ChangeBuff: buffs/debuffs on a unit
                 try:
                     cb = mp_unpack(data)
-                    log(f"{self.tag()} -> client event 50(ChangeBuff) {cb}")
+                    if LOG_BUFFS:
+                        log(f"{self.tag()} -> client event 50(ChangeBuff) {cb}")
                     if CLEANSE and self.in_quest:
                         self.cleanse_from_changebuff(cb)
                 except Exception:  # noqa: BLE001
@@ -723,9 +732,26 @@ class Peer:
         for cond, ability_id, product_id, group, frm in found:
             from_actor = int(frm[0]) if isinstance(frm, list) and frm else 0
             if from_actor == -1 or group == 3:
-                evt = [self.next_ev_seq(EV_RESET_BUFF_REQUEST), character, cond, ability_id, product_id]
-                log(f"{self.tag()} CLEANSE: removing condition {cond} (from actor {from_actor}, group {group}) on unit {character}")
-                self.raise_plugin_event(EV_RESET_BUFF_REQUEST, evt)
+                if cond in CLEANSE_SKIP_CONDITIONS:
+                    continue
+                key = (tuple(character), cond)
+                if time.time() - self.cleanse_recent.get(key, 0) < 2.5:   # a volley is already in flight
+                    continue
+                self.cleanse_recent[key] = time.time()
+                log(f"{self.tag()} CLEANSE: volley for condition {cond} on unit {character} (sends at 0/0.7/2.0s)")
+                # 2026-08-31 惡魔審判 finding (log-proven, 6 waves): one immediate reset strips enemy debuffs from
+                # the three AI units but never from the player-controlled lead unit — its removal only succeeds on a
+                # DELAYED retry (lead-unit removals landed at +1.2/+2.4/+2.7s = the 0.7s/2.0s repeats). So each
+                # detection sends the echoed reset three times: now, +0.7s, +2.0s.
+                self.send_cleanse(character, cond, ability_id, product_id)
+                threading.Timer(0.7, self.send_cleanse, args=(character, cond, ability_id, product_id)).start()
+                threading.Timer(2.0, self.send_cleanse, args=(character, cond, ability_id, product_id)).start()
+
+    def send_cleanse(self, character, cond, ability_id, product_id):
+        if not self.in_quest:
+            return
+        evt = [self.next_ev_seq(EV_RESET_BUFF_REQUEST), character, cond, ability_id, product_id]
+        self.send_event(EV_RESET_BUFF_REQUEST, {245: mp_pack(evt), 254: 0})   # quiet: the volley line above logs it
 
     def send_reborn(self, targets):
         if not self.in_quest:
@@ -746,21 +772,28 @@ class Peer:
         if SPFILL:
             log(f"{self.tag()} SPFILL: refilling every skill of units {targets} every {SP_INTERVAL}s")
         n = 0
-        shield_every = max(1, int(round(SHIELD_INTERVAL / GOD_INTERVAL)))
+        # 2026-08-31 slowdown fix: the old loop fired every unit's full volley in the same tick — with 8 slots
+        # (party-switch quests) that was ~120 reliable events in one burst every second, ~144/s sustained, and the
+        # game visibly lagged. Now the work is STAGGERED across ticks and thinned: each unit healed every 0.4s
+        # (half the units per 0.2s tick), each unit's buff volley every BUFF_PERIOD 2s (at most one unit's volley
+        # per tick), SP refills spread over the second. ~80 events/s, peak burst ~20.
+        buff_ticks = max(1, int(round(BUFF_PERIOD / GOD_INTERVAL)))
         sp_every = max(1, int(round(SP_INTERVAL / GOD_INTERVAL)))
+        nt = len(targets)
         while self.in_quest and self.state in ("joined",) and n < 7200:
-            for i in targets:
+            for k, i in enumerate(targets):
                 try:
                     if GODMODE:
                         # RecoveryHpRequest: [seq, character[actorId,index], from[actorId,index], healValue, characterType,
                         #                     elementIndex, actionId, productId, bulletId, skillId, followerAvoid]
-                        evt = [self.next_ev_seq(EV_RECOVERY_HP_REQUEST), [1, i], [1, i], 999999, 0, HEAL_HITATTR_INDEX, 0, 0, 0, 0, 0]
-                        self.send_event(EV_RECOVERY_HP_REQUEST, {245: mp_pack(evt), 254: 0})
-                        if n % shield_every == 0:   # shield + damage-cut + attack buffs via the hit attributes' ActionCondition
+                        if (n + k) % 2 == 0:   # each unit every 0.4s; the shield + damage cuts cover the gap
+                            evt = [self.next_ev_seq(EV_RECOVERY_HP_REQUEST), [1, i], [1, i], 999999, 0, HEAL_HITATTR_INDEX, 0, 0, 0, 0, 0]
+                            self.send_event(EV_RECOVERY_HP_REQUEST, {245: mp_pack(evt), 254: 0})
+                        if n % buff_ticks == (k * buff_ticks) // nt:   # shield + damage-cut + attack buffs, one unit's volley per tick
                             for idx in BUFF_HITATTR_INDEXES + ATK_BUFF_HITATTR_INDEXES + [DP_HITATTR_INDEX]:
                                 evt = [self.next_ev_seq(EV_RECOVERY_HP_REQUEST), [1, i], [1, i], 1, 0, idx, 0, 0, 0, 0, 0]
                                 self.send_event(EV_RECOVERY_HP_REQUEST, {245: mp_pack(evt), 254: 0})
-                    if SPFILL and n % sp_every == 0:
+                    if SPFILL and n % sp_every == k % sp_every:   # each unit once per SP_INTERVAL, spread over the ticks
                         # RecoverySpRequest: [seq, character, healRatio, healSkillIndex (0 = all), isHumanOnly, healValue, isDragonOnly]
                         # both forms are required — neither fills alone (see the SPFILL constants block above)
                         evt = [self.next_ev_seq(EV_RECOVERY_SP_REQUEST), [1, i], 1.0, 0, False, 0, False]
