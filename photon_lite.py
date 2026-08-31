@@ -922,7 +922,11 @@ class Peer:
             self.in_quest = False
             req = mp_unpack(data)               # [seq, RecordMultiRequest bytes]
             body = mp_unpack(req[1])
-            body["connecting_viewer_id_list"] = []
+            # Omit connecting_viewer_id_list entirely: if the key is present (even []), Dawnshard's record_multi runs
+            # ProcessFirstMeetingRewards = its stub co-op social reward (100 free Diamantium per OTHER player met),
+            # which for a solo room shows a "Diamantium x0" line on the results screen and mails a x0 present every
+            # clear. With the key missing the server takes the GetTeammates fallback (empty -> no bonus, no present).
+            body.pop("connecting_viewer_id_list", None)
             body["is_host"] = True
             body["member_count"] = self.used_member_count(1)
             raw = msgpack.packb(body, use_bin_type=True)
