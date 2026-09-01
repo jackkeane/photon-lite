@@ -12,7 +12,11 @@ verified on a real phone. Rooms with a second device are **not** implemented (se
 ## What it does
 
 * Speaks the client's Photon transport: ENet-style reliable UDP with CRC-32 headers, acks, fragments,
-  the `Init` handshake, Photon's Diffie-Hellman/AES message encryption and the Protocol16 serializer.
+  a send window with timed retransmission of unacknowledged packets, the `Init` handshake, Photon's
+  Diffie-Hellman/AES message encryption and the Protocol16 serializer. The retransmission layer is what
+  makes **emulator clients (e.g. an Android client in BlueStacks)** work — their NAT drops packets when
+  the multi-fragment join bursts overflow the client's receive buffer, and without resends one lost
+  fragment stalls the room forever.
 * Implements the LoadBalancing operations the client uses: Authenticate, JoinLobby, JoinRandomGame,
   CreateGame/JoinGame (master → game-server redirect), SetProperties, RaiseEvent, Leave.
 * Ports the room logic of Dawnshard's Photon plugin: `GoToIngameState` 1→4 (`GoToIngameInfo`,
@@ -24,9 +28,11 @@ verified on a real phone. Rooms with a second device are **not** implemented (se
   more than one player, so the server seats a "ghost" second player (ready, no units), and sends the
   host's whole party (`--fill`, default 4; Dawnshard's rule would be leader + 2 AI).
 * Optional cheats (server-injected events the owning client applies to its own units): `--godmode`
-  (full heal 5×/s, a damage shield, 70/60/50 % damage-cut buffs and removal of every debuff an enemy
-  applies), `--atkbuff` (+225 % attack, immune to Curse of Emptiness) and `--spfill` (every skill
-  gauge refilled once a second, so skills are always ready).
+  (full heal 5×/s, a damage shield, 70/60/50 % damage-cut buffs and a debuff cleanse), `--atkbuff`
+  (+225 % attack, immune to Curse of Emptiness) and `--spfill` (every skill gauge refilled once a
+  second, so skills are always ready). The cleanse is closed-loop: each enemy debuff is tracked by its
+  sync key and the removal request is repeated every 1.5 s until the client broadcasts that the buff is
+  gone (30 s cap). See *Limits* for the one debuff it cannot remove.
 * Party-switch quests (two teams, e.g. Diabolos) work: the ghost player follows the host through the
   team-change phases.
 
@@ -77,7 +83,7 @@ verified on a real phone. Rooms with a second device are **not** implemented (se
 | `--no-ghost` | off | don't seat the ghost second player (normal rooms then can't be started alone) |
 | `--godmode` | off | heal every unit 2.5×/s + 100 %-of-max-HP damage shield + damage-cut buffs every 2 s (staggered across ticks to keep the event load smooth) |
 | `--atkbuff` | off | five plain attack-up buffs (+225 % if they stack), refreshed with the god-mode volley |
-| `--cleanse` | off (on with `--godmode`) | remove every condition an enemy puts on your units — sent three times (now / +0.7 s / +2 s) because the player-controlled unit only accepts the removal on a delayed retry |
+| `--cleanse` | off (on with `--godmode`) | remove conditions an enemy puts on your units — closed loop: each application is tracked by its sync key and the removal is retried every 1.5 s until the client confirms it, up to 30 s (see *Limits*) |
 | `--no-cleanse` | off | disable the cleanse even with `--godmode` (A/B testing) |
 | `--spfill` | off | refill every unit's skill gauges (SP) to 100 % once a second |
 | `--log-buffs` | off | decode-log every ChangeBuff event (multi-KB lines — heavy in busy fights) |
@@ -89,9 +95,18 @@ verified on a real phone. Rooms with a second device are **not** implemented (se
 * `--godmode` refills HP, it does not make units invulnerable: a hit larger than max HP or a rare
   multi-hit chain can still kill. Auto-revive only works in quests whose `_RebornLimit` allows revives
   (normal co-op quests do; most raids don't).
-* `--cleanse` cannot remove conditions the game marks as reset-proof (Curse of Emptiness / "nihil",
-  and the Lock-On marker — the stub skips those to save event traffic); everything else, including
-  shapeshift-blocking seals like Demonic Judgment, goes away within a couple of seconds.
+* **`--cleanse` cannot clean the avatar you are playing in judgment-mechanic fights.** Established
+  across many instrumented runs (Yaldabaoth's party-switch fight, Demonic Judgment): each time the
+  boss applies the debuff, the three units you are *not* controlling are cleansed within half a
+  second, but the copy on the avatar you are actively using refuses the removal event — 30-second
+  barrages and every identifier combination were tried, and the client discards them all. That stack
+  is then permanent for the run (later removals only match newer applications), so the avatar you
+  play accumulates judgment while the rest of the party stays clean. Switching avatars *after* being
+  hit does not free it; a unit hit while you are *not* controlling it cleanses normally. The block is
+  inside the client's handling of the controlled character and is not reachable through the co-op
+  protocol. (One recorded exception — an AI unit refusing once — remains unexplained.)
+* `--cleanse` also skips conditions the game data marks reset-proof (`_ResistDebuffReset`, e.g. the
+  Lock-On marker) and Curse of Emptiness.
 * Scaling `hp`/`attack` in the HeroParam data does nothing — the client derives unit stats from master
   data + level (`--cheat` is kept only for experiments).
 * No random matching with strangers, no room lists across servers.
