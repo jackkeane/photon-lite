@@ -100,15 +100,17 @@ CLEANSE = (_ARGS.cleanse or _ARGS.godmode) and not _ARGS.no_cleanse
 LOG_BUFFS = _ARGS.log_buffs
 EV_CHANGE_BUFF = 50
 EV_RESET_BUFF_REQUEST = 75
-# Conditions that resist ResetBuffRequest BY DATA: only those with ActionCondition._ResistDebuffReset = 1
-# (標的/lock-on 1671). 虛無/Curse of Emptiness 1599 was wrongly listed here on 2026-08-31 ("never removes
-# anything") — master data shows it has NO _ResistDebuffReset, and the 2026-09-01 party-switch investigation
-# proved the wire-visible outcome: 1989 was being cleansed all along (its remove broadcasts appear 2-6 s after
-# every application; the remove events' character fields are scrambled, which hid this), while the icon that
-# visibly stayed on the phase-2 leader the whole fight was 1599 (600 s duration, applied to the whole team at
-# the party switch) — skipped, so never volleyed. Same lesson as the Android appear-voice: re-test "disproved"
-# fixes once the masking bug is gone.
-CLEANSE_SKIP_CONDITIONS = {1671}
+# Conditions the cleanse does not volley. 標的/lock-on 1671 has ActionCondition._ResistDebuffReset = 1 (the
+# real reset-resistant flag). 虛無/Curse of Emptiness 1599 has NO such flag, but volleying it (2026-09-01,
+# commit 6f5bb50) coincided with the user reporting that phase-1 惡魔審判 1989 removal stopped working in the
+# party-switch fight, so it is back on the skip list until the instrumented diagnosis (see LOG_BUFFS) explains
+# the interaction. 2026-09-01 state of knowledge: every layer of the reset path was verified sound in the iOS
+# binary (OnEvent 75 → FindCharacterFromCharacterId → HasMultiPlayOwner(chara, true, actorIdSelf) →
+# buffCtrl.ResetBuffDebuffByConditionId; unified-managed stacks matched via cond@0x5C/ability@0x60/product@0x24
+# of each entry, reason 0xff passes ProcessScaledBuffOnRemoveForReason) and the send envelope is identical to
+# the working god-mode heals — yet the user observes 1989 sticking and stacking in this fight. Ground truth
+# needed from a live run with buff logging before any further theory.
+CLEANSE_SKIP_CONDITIONS = {1599, 1671}
 # Party-switch quests: at each phase the host raises GameStepEvent (96, [seq, step]) and MultiPlayWaitingList
 # .StartWaitForAllOthers waits for the same step from every other actor (PartySwitchTimeout after ~10 s otherwise).
 # The ghost echoes each step as its own event (sender = ghost actor).
@@ -830,9 +832,13 @@ class Peer:
 
     def send_cleanse(self, character, cond, ability_id, product_id):
         if not self.in_quest:
+            log(f"{self.tag()} CLEANSE-SEND SKIPPED (not in quest): unit {character} cond {cond}")
             return
-        evt = [self.next_ev_seq(EV_RESET_BUFF_REQUEST), character, cond, ability_id, product_id]
-        self.send_event(EV_RESET_BUFF_REQUEST, {245: mp_pack(evt), 254: 0})   # quiet: the volley line above logs it
+        with self.lock:   # seq assignment + send atomic: concurrent volley timers must not reorder/duplicate seqs
+            seq = self.next_ev_seq(EV_RESET_BUFF_REQUEST)
+            evt = [seq, character, cond, ability_id, product_id]
+            log(f"{self.tag()} CLEANSE-SEND seq {seq}: unit {character} cond {cond} ability {ability_id} product {product_id}")
+            self.send_event(EV_RESET_BUFF_REQUEST, {245: mp_pack(evt), 254: 0})
 
     def send_reborn(self, targets):
         if not self.in_quest:
