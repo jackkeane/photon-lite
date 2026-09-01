@@ -837,12 +837,14 @@ class Peer:
                 # unified 惡魔審判 (1989), SOME unit's application refuses ResetBuffRequest each wave — 30 s
                 # barrages and an (ability, product) variant probe (broadcast values / zeros / action id
                 # combos) all refused — while the same sends cleanse the other units in 0.5 s and plain
-                # conditions (e.g. 1605) cleanse everywhere. THE LAW (9/9 logged waves): the refusing unit is
-                # the LAST-APPLIED of the batch (highest multiPlayKey) = the cast's primary/marked target —
-                # usually the aggro holder (the controlled avatar most of the time, but an AI unit that pulled
-                # aggro gets marked instead, e.g. the 4th slot while the player controlled the 2nd). The
-                # marked copy is bound into the boss's field mechanic (EnemyAbilityProcDevilField, the
-                # Yaldabaoth Devil/Angel judgment kit); the three splash copies are ordinary stacks. A refused stack
+                # conditions (e.g. 1605) cleanse everywhere. USER-VERIFIED RULE (controlled experiment,
+                # 15:12 run: played the primary until debuffed, then switched): the avatar the player is
+                # actively USING is the one whose judgment refuses removal — only the primary refused in p1
+                # (both waves) and only the lead in p2 (all waves), while every other unit confirmed in
+                # 0.5 s; switching AFTER being debuffed does not free the stuck stack. One recorded
+                # exception (the 4th slot refusing while the player used the 2nd, 14:51 run) = a rare edge
+                # case, cause unknown. Earlier "last-applied/marked-target" and "aggro" laws: disproven,
+                # retracted. A refused stack
                 # persists to quest end (reason 1): later waves' removals match only the new application's
                 # product, so the icon's stack count never drops once a wave slips through. The retries below
                 # still catch momentary refusals; full removal on the affected unit is out of reach via 75.
