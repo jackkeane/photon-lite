@@ -833,13 +833,16 @@ class Peer:
                 targets = [list(character)]
                 if character[1] >= LATTER_PARTY_INDEX_OFFSET:
                     targets.append([character[0], character[1] % LATTER_PARTY_INDEX_OFFSET])
-                # KNOWN LIMITATION (2026-09-01, instrumented across 4 phone runs, user-accepted): the avatar
-                # the player is ACTIVELY CONTROLLING refuses ResetBuffRequest for its unified 惡魔審判 (1989)
-                # — 30 s barrages and an (ability, product) variant probe (broadcast values / zeros / action id
-                # combos, 5 variants) all refused, while the same sends cleanse every other unit in 0.5 s and
-                # plain conditions (e.g. 1605) cleanse even on the controlled avatar. Removal only happens at
-                # quest end (reason 1) or after control switches away (a later wave then cleanses normally).
-                # The retries below still matter: they catch momentary refusals and cover control switches.
+                # KNOWN LIMITATION (2026-09-01, instrumented across 5 phone runs, user-accepted): for the
+                # unified 惡魔審判 (1989), SOME unit's application refuses ResetBuffRequest each wave — 30 s
+                # barrages and an (ability, product) variant probe (broadcast values / zeros / action id
+                # combos) all refused — while the same sends cleanse the other units in 0.5 s and plain
+                # conditions (e.g. 1605) cleanse everywhere. WHICH unit refuses varies between runs/phases and
+                # does NOT map cleanly to party slot or active control (observed refusers: the primary while
+                # controlled AND not, and the 4th slot while the player controlled the 2nd). A refused stack
+                # persists to quest end (reason 1): later waves' removals match only the new application's
+                # product, so the icon's stack count never drops once a wave slips through. The retries below
+                # still catch momentary refusals; full removal on the affected unit is out of reach via 75.
                 now = time.time()
                 with self.lock:
                     self.cleanse_pending[(tuple(character), cond)] = {
