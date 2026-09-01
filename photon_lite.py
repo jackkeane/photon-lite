@@ -100,10 +100,15 @@ CLEANSE = (_ARGS.cleanse or _ARGS.godmode) and not _ARGS.no_cleanse
 LOG_BUFFS = _ARGS.log_buffs
 EV_CHANGE_BUFF = 50
 EV_RESET_BUFF_REQUEST = 75
-# Conditions that resist ResetBuffRequest by design (虛無/nihil 1599, 標的/lock-on 1671): resets for them are pure
-# event-channel load and never remove anything, so cleanse skips them (2026-08-31 slowdown fix — the Diabolos AoE
-# applies 3 conditions per unit at once and only 惡魔審判 1989 is actually removable).
-CLEANSE_SKIP_CONDITIONS = {1599, 1671}
+# Conditions that resist ResetBuffRequest BY DATA: only those with ActionCondition._ResistDebuffReset = 1
+# (標的/lock-on 1671). 虛無/Curse of Emptiness 1599 was wrongly listed here on 2026-08-31 ("never removes
+# anything") — master data shows it has NO _ResistDebuffReset, and the 2026-09-01 party-switch investigation
+# proved the wire-visible outcome: 1989 was being cleansed all along (its remove broadcasts appear 2-6 s after
+# every application; the remove events' character fields are scrambled, which hid this), while the icon that
+# visibly stayed on the phase-2 leader the whole fight was 1599 (600 s duration, applied to the whole team at
+# the party switch) — skipped, so never volleyed. Same lesson as the Android appear-voice: re-test "disproved"
+# fixes once the masking bug is gone.
+CLEANSE_SKIP_CONDITIONS = {1671}
 # Party-switch quests: at each phase the host raises GameStepEvent (96, [seq, step]) and MultiPlayWaitingList
 # .StartWaitForAllOthers waits for the same step from every other actor (PartySwitchTimeout after ~10 s otherwise).
 # The ghost echoes each step as its own event (sender = ghost actor).
