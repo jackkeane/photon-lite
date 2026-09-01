@@ -17,7 +17,7 @@ Dawnshard (docker-compose environment):
 Protocol facts were read from the 2.19.0 iOS client binary and verified on the wire; the room logic follows
 Dawnshard's PhotonPlugin (MIT). Not affiliated with Exit Games / Photon, Cygames or Nintendo.
 """
-import argparse, hashlib, os, random, socket, struct, sys, threading, time, datetime, zlib, traceback, re, json
+import argparse, collections, hashlib, os, random, socket, struct, sys, threading, time, datetime, zlib, traceback, re, json
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -411,6 +411,13 @@ class Peer:
         self.in_quest = False
         self.ev_seq = {}                # event code -> running _raiseEventSequenceId
         self.cleanse_recent = {}        # (unit tuple, conditionId) -> time of the last cleanse volley (dedupe)
+        # Reliable delivery (2026-09-01): BlueStacks' NAT drops packets when a >~64 KB burst overflows the
+        # client's UDP receive buffer (observed: ack gap at seq ~128 of a 202-fragment join+ghost burst), and
+        # ENet delivers reliably IN ORDER, so one lost fragment stalls the client's receive stream forever
+        # (ghost invisible, raid start aborting with "matching disconnect1"). Fix = real ENet behaviour:
+        # cap in-flight unacked packets (window) and retransmit on timeout until acked.
+        self.unacked = {}               # (chan, seq) -> [cmd_bytes, next_resend_monotonic_s, resend_count]
+        self.sendq = collections.deque()  # (chan, seq, cmd_bytes) built but deferred while the window is full
 
     def tag(self):
         return f"[{self.server.role}:{self.addr[0]}:{self.addr[1]}]"
@@ -433,15 +440,66 @@ class Peer:
         return self.cmd(CT_ACK, chan, 0, struct.pack(">II", relseq, senttime), 0)
 
     FRAG_SIZE = 480  # client MTU is 576 (Connect payload); 16 hdr + 12 cmd + 20 fragment hdr + 480 = 528 bytes/datagram
+    WINDOW = 48       # max unacked reliable packets in flight (~25 KB wire) — stays under the ~64 KB receive
+                      # buffer that BlueStacks overflowed at ~128 packets; LAN acks refill it within a few ms
+    RTO_S = 0.25      # first retransmission after 250 ms, doubling per resend up to RTO_MAX_S
+    RTO_MAX_S = 2.0
+    RESEND_GIVEUP = 15  # ~20 s of retries, then the packet is dropped (peer is gone)
 
     def send_reliable(self, chan, payload, extra_cmds=()):
         with self.lock:
             self._send_reliable(chan, payload, extra_cmds)
 
+    def _queue_reliable(self, ctype, chan, payload):
+        seq = self.next_seq(chan)
+        self.sendq.append((chan, seq, self.cmd(ctype, chan, 1, payload, seq)))
+        return seq
+
+    def _pump_sendq(self):
+        t = time.monotonic()
+        while self.sendq and len(self.unacked) < self.WINDOW:
+            chan, seq, c = self.sendq.popleft()
+            self.unacked[(chan, seq)] = [c, t + self.RTO_S, 0]
+            self.send_cmds([c])
+
+    def on_ack(self, chan, aseq):
+        with self.lock:
+            self.unacked.pop((chan, aseq), None)
+            self._pump_sendq()
+
+    def retransmit_due(self):
+        """Called from the retransmit thread every ~100 ms; resends unacked reliable packets past their RTO."""
+        with self.lock:
+            if self.state == "disconnected" or not self.unacked:
+                return
+            t = time.monotonic()
+            resent = dropped = 0
+            for key, ent in list(self.unacked.items()):
+                if t < ent[1]:
+                    continue
+                if ent[2] >= self.RESEND_GIVEUP:
+                    del self.unacked[key]
+                    dropped += 1
+                    continue
+                ent[2] += 1
+                ent[1] = t + min(self.RTO_S * (2 ** ent[2]), self.RTO_MAX_S)
+                try:
+                    self.send_cmds([ent[0]])
+                except OSError:
+                    pass
+                resent += 1
+            if resent or dropped:
+                log(f"{self.tag()} retransmit: {resent} pkt(s) resent"
+                    + (f", {dropped} given up" if dropped else "")
+                    + f" ({len(self.unacked)} in flight, {len(self.sendq)} queued)")
+            self._pump_sendq()
+
     def _send_reliable(self, chan, payload, extra_cmds=()):
         if len(payload) <= self.FRAG_SIZE:
-            c = self.cmd(CT_RELIABLE, chan, 1, payload, self.next_seq(chan))
-            self.send_cmds(list(extra_cmds) + [c])
+            if extra_cmds:
+                self.send_cmds(list(extra_cmds))
+            self._queue_reliable(CT_RELIABLE, chan, payload)
+            self._pump_sendq()
             return
         # Photon fragmentation: each fragment is its own reliable command (own sequence number); payload header =
         # startSequenceNumber, fragmentCount, fragmentNumber, totalLength, fragmentOffset (all big-endian int32).
@@ -454,7 +512,8 @@ class Peer:
             off = i * self.FRAG_SIZE
             chunk = payload[off:off + self.FRAG_SIZE]
             hdr = struct.pack(">IIIII", start, count, i, total, off)
-            self.send_cmds([self.cmd(CT_FRAGMENT, chan, 1, hdr + chunk, self.next_seq(chan))])
+            self._queue_reliable(CT_FRAGMENT, chan, hdr + chunk)
+        self._pump_sendq()
         log(f"{self.tag()} <- (sent {total} bytes as {count} fragments, seq {start}..{start + count - 1})")
 
     # ---- message building
@@ -515,13 +574,17 @@ class Peer:
                 self.state = "connecting"
             verify = bytearray(payload)
             struct.pack_into(">H", verify, 0, self.peer_id)
-            self.send_cmds([self.ack(chan, relseq, senttime),
-                            self.cmd(CT_VERIFY, chan, 1, bytes(verify), self.next_seq(chan))])
+            with self.lock:
+                vseq = self.next_seq(chan)
+                vcmd = self.cmd(CT_VERIFY, chan, 1, bytes(verify), vseq)
+                self.unacked[(chan, vseq)] = [vcmd, time.monotonic() + self.RTO_S, 0]
+                self.send_cmds([self.ack(chan, relseq, senttime), vcmd])
             log(f"{self.tag()} <- Ack + VerifyConnect (peerId={self.peer_id})")
             return
         if ctype == CT_ACK:
             aseq, atime = struct.unpack_from(">II", payload, 0)
             log(f"{self.tag()} -> Ack chan={chan} seq={aseq} (hdrPeer={hdr_peer})")
+            self.on_ack(chan, aseq)
             return
         if ctype == CT_DISCONNECT:
             log(f"{self.tag()} -> Disconnect (hdrPeer={hdr_peer}, flags={cflags}, seq={relseq})")
@@ -529,6 +592,9 @@ class Peer:
             self.send_cmds([self.ack(chan, relseq, senttime)])
             log(f"{self.tag()} <- Ack(Disconnect)")
             self.state = "disconnected"
+            with self.lock:
+                self.unacked.clear()
+                self.sendq.clear()
             return
         if ctype == CT_PING:
             log(f"{self.tag()} -> Ping"); return
@@ -1150,6 +1216,17 @@ class Server:
                 log(f"{peer.tag()} packet error:\n{traceback.format_exc()}")
 
 
+def retransmit_loop(servers):
+    while True:
+        time.sleep(0.1)
+        for srv in servers:
+            for peer in list(srv.peers.values()):
+                try:
+                    peer.retransmit_due()
+                except Exception:
+                    log(f"{peer.tag()} retransmit error:\n{traceback.format_exc()}")
+
+
 if __name__ == "__main__":
     master = Server("master", MASTER_PORT)
     game = Server("game", GAME_PORT)
@@ -1159,4 +1236,5 @@ if __name__ == "__main__":
     GAME_SERVER = game
     threading.Thread(target=game.run, daemon=True).start()
     threading.Thread(target=run_state_http, daemon=True).start()
+    threading.Thread(target=retransmit_loop, args=([master, game],), daemon=True).start()
     master.run()
