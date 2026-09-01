@@ -815,12 +815,12 @@ class Peer:
         found = []
         for p in cb[2] or []:          # ParameterSyncData: [key, type, conditionId, dur, num, skill, action, ability, product, rate, group, from, ...]
             if isinstance(p, list) and len(p) >= 12:
-                found.append((int(p[0]), int(p[2]), int(p[7]), int(p[8]), int(p[10]), p[11], int(p[6])))
+                found.append((int(p[0]), int(p[2]), int(p[7]), int(p[8]), int(p[10]), p[11]))
         if len(cb) > 8:
             for p in cb[8] or []:      # UnifiedParameterSyncData: [key, conditionId, dur, num, skill, action, ability, product, group, from, ...]
                 if isinstance(p, list) and len(p) >= 10:
-                    found.append((int(p[0]), int(p[1]), int(p[6]), int(p[7]), int(p[8]), p[9], int(p[5])))
-        for buff_key, cond, ability_id, product_id, group, frm, action_id in found:
+                    found.append((int(p[0]), int(p[1]), int(p[6]), int(p[7]), int(p[8]), p[9]))
+        for buff_key, cond, ability_id, product_id, group, frm in found:
             from_actor = int(frm[0]) if isinstance(frm, list) and frm else 0
             if from_actor == -1 or group == 3:
                 if cond in CLEANSE_SKIP_CONDITIONS:
@@ -833,25 +833,23 @@ class Peer:
                 targets = [list(character)]
                 if character[1] >= LATTER_PARTY_INDEX_OFFSET:
                     targets.append([character[0], character[1] % LATTER_PARTY_INDEX_OFFSET])
-                # The reset handler requires an EXACT match on (abilityId, productId) (ignore flags are
-                # hardcoded false). The leader's 惡魔審判 never matches the broadcast values even though its
-                # broadcast row is identical to the servants' — so retries CYCLE through candidate pairs;
-                # the CONFIRMED log line then reveals which pair the real buff instance stores.
-                variants = []
-                for v in ((ability_id, product_id), (0, 0), (action_id, product_id),
-                          (action_id, 0), (ability_id, 0)):
-                    if v not in variants:
-                        variants.append(v)
+                # KNOWN LIMITATION (2026-09-01, instrumented across 4 phone runs, user-accepted): the avatar
+                # the player is ACTIVELY CONTROLLING refuses ResetBuffRequest for its unified 惡魔審判 (1989)
+                # — 30 s barrages and an (ability, product) variant probe (broadcast values / zeros / action id
+                # combos, 5 variants) all refused, while the same sends cleanse every other unit in 0.5 s and
+                # plain conditions (e.g. 1605) cleanse even on the controlled avatar. Removal only happens at
+                # quest end (reason 1) or after control switches away (a later wave then cleanses normally).
+                # The retries below still matter: they catch momentary refusals and cover control switches.
                 now = time.time()
                 with self.lock:
                     self.cleanse_pending[(tuple(character), cond)] = {
                         "key": buff_key, "targets": targets, "cond": cond,
-                        "variants": variants, "vi": 0,
+                        "ability": ability_id, "product": product_id,
                         "t0": now, "next": now, "until": now + 30.0, "sent": 0,
                     }
                 log(f"{self.tag()} CLEANSE: tracking cond {cond} key {buff_key} on unit {character}"
                     + (f" (+alias {targets[1]})" if len(targets) > 1 else "")
-                    + f" — retry 1.5s cycling {len(variants)} (ability,product) variants until confirmed (30s cap)")
+                    + " — retry 1.5s until removal confirmed (30s cap)")
                 self.pump_cleanse()
 
     def pump_cleanse(self):
@@ -867,10 +865,8 @@ class Peer:
                     continue
                 if now >= ent["next"]:
                     ent["next"] = now + 1.5
-                    ability, product = ent["variants"][ent["vi"] % len(ent["variants"])]
-                    ent["vi"] += 1
                     ent["sent"] += len(ent["targets"])
-                    due.append((list(ent["targets"]), ent["cond"], ability, product))
+                    due.append((list(ent["targets"]), ent["cond"], ent["ability"], ent["product"]))
         for targets, cond, ability, product in due:
             for t in targets:
                 self.send_cleanse(t, cond, ability, product)
@@ -890,13 +886,10 @@ class Peer:
 
     def send_cleanse(self, character, cond, ability_id, product_id):
         if not self.in_quest:
-            log(f"{self.tag()} CLEANSE-SEND SKIPPED (not in quest): unit {character} cond {cond}")
             return
-        with self.lock:   # seq assignment + send atomic: concurrent volley timers must not reorder/duplicate seqs
-            seq = self.next_ev_seq(EV_RESET_BUFF_REQUEST)
-            evt = [seq, character, cond, ability_id, product_id]
-            log(f"{self.tag()} CLEANSE-SEND seq {seq}: unit {character} cond {cond} ability {ability_id} product {product_id}")
-            self.send_event(EV_RESET_BUFF_REQUEST, {245: mp_pack(evt), 254: 0})
+        with self.lock:   # seq assignment + send atomic so concurrent senders cannot reorder/duplicate seqs
+            evt = [self.next_ev_seq(EV_RESET_BUFF_REQUEST), character, cond, ability_id, product_id]
+            self.send_event(EV_RESET_BUFF_REQUEST, {245: mp_pack(evt), 254: 0})   # quiet: tracking/confirmed lines log it
 
     def send_reborn(self, targets):
         if not self.in_quest:
