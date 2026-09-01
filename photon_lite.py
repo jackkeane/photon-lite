@@ -801,17 +801,27 @@ class Peer:
                 if cond in CLEANSE_SKIP_CONDITIONS:
                     continue
                 key = (tuple(character), cond)
-                if time.time() - self.cleanse_recent.get(key, 0) < 2.5:   # a volley is already in flight
+                if time.time() - self.cleanse_recent.get(key, 0) < 7.0:   # a volley is already in flight
                     continue
                 self.cleanse_recent[key] = time.time()
-                log(f"{self.tag()} CLEANSE: volley for condition {cond} on unit {character} (sends at 0/0.7/2.0s)")
                 # 2026-08-31 惡魔審判 finding (log-proven, 6 waves): one immediate reset strips enemy debuffs from
                 # the three AI units but never from the player-controlled lead unit — its removal only succeeds on a
-                # DELAYED retry (lead-unit removals landed at +1.2/+2.4/+2.7s = the 0.7s/2.0s repeats). So each
-                # detection sends the echoed reset three times: now, +0.7s, +2.0s.
-                self.send_cleanse(character, cond, ability_id, product_id)
-                threading.Timer(0.7, self.send_cleanse, args=(character, cond, ability_id, product_id)).start()
-                threading.Timer(2.0, self.send_cleanse, args=(character, cond, ability_id, product_id)).start()
+                # DELAYED retry (lead-unit removals landed at +1.2/+2.4/+2.7s = the 0.7s/2.0s repeats).
+                # 2026-09-01 party-switch finding: in phase 2 the CONTROLLED lead ([1,40]) refused every reset
+                # across two full volleys while AI units 41-43 accepted — the controlled unit's reset handler
+                # resolves by ACTIVE-party index, not roster index (heal/SP at 40+i work; reset 75 is a different
+                # path). So latter-party volleys are also sent aliased to [actor, i % 40] (a no-op on whichever
+                # interpretation is wrong), and the volley is longer to outlast refusal windows.
+                targets = [character]
+                if character[1] >= LATTER_PARTY_INDEX_OFFSET:
+                    targets.append([character[0], character[1] % LATTER_PARTY_INDEX_OFFSET])
+                log(f"{self.tag()} CLEANSE: volley for condition {cond} on unit {character}"
+                    + (f" (+alias {targets[1]})" if len(targets) > 1 else "")
+                    + " (sends at 0/0.7/1.5/2.5/4/6s)")
+                for t in targets:
+                    self.send_cleanse(t, cond, ability_id, product_id)
+                    for d in (0.7, 1.5, 2.5, 4.0, 6.0):
+                        threading.Timer(d, self.send_cleanse, args=(t, cond, ability_id, product_id)).start()
 
     def send_cleanse(self, character, cond, ability_id, product_id):
         if not self.in_quest:
