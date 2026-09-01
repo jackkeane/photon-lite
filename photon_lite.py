@@ -417,7 +417,8 @@ class Peer:
         self.lock = threading.RLock()   # send path is used from the UDP thread and the god-mode thread
         self.in_quest = False
         self.ev_seq = {}                # event code -> running _raiseEventSequenceId
-        self.cleanse_recent = {}        # (unit tuple, conditionId) -> time of the last cleanse volley (dedupe)
+        self.cleanse_recent = {}        # (unit tuple, conditionId) -> time of the last cleanse volley (legacy, unused)
+        self.cleanse_pending = {}       # (unit tuple, conditionId) -> {key, targets, ability, product, t0, next, until, sent}
         # Reliable delivery (2026-09-01): BlueStacks' NAT drops packets when a >~64 KB burst overflows the
         # client's UDP receive buffer (observed: ack gap at seq ~128 of a 202-fragment join+ghost burst), and
         # ENet delivers reliably IN ORDER, so one lost fragment stalls the client's receive stream forever
@@ -794,41 +795,87 @@ class Peer:
         character = [int(cb[1][0]), int(cb[1][1])]
         if character[0] != 1:
             return
+        # --- confirmation: the client broadcasts every removal (plain slot 3, unified slot 9) with the buff KEY;
+        # a removal (any reason) of a tracked key means the debuff is gone — stop retrying.
+        removes = []
+        for slot in (3, 9):
+            if len(cb) > slot:
+                for p in cb[slot] or []:
+                    if isinstance(p, list) and len(p) >= 2:
+                        removes.append((int(p[0]), int(p[1])))
+        if removes:
+            with self.lock:
+                for pkey, ent in list(self.cleanse_pending.items()):
+                    if pkey[0] == tuple(character):
+                        hit = [r for r in removes if r[0] == ent["key"]]
+                        if hit:
+                            log(f"{self.tag()} CLEANSE CONFIRMED: unit {character} cond {pkey[1]} key {ent['key']} "
+                                f"removed reason {hit[0][1]} after {time.time() - ent['t0']:.1f}s ({ent['sent']} send(s))")
+                            del self.cleanse_pending[pkey]
         found = []
-        for p in cb[2] or []:          # addParameters: [key, type, conditionId, dur, num, skill, action, ability, product, rate, group, from, ...]
+        for p in cb[2] or []:          # ParameterSyncData: [key, type, conditionId, dur, num, skill, action, ability, product, rate, group, from, ...]
             if isinstance(p, list) and len(p) >= 12:
-                found.append((int(p[2]), int(p[7]), int(p[8]), int(p[10]), p[11]))
+                found.append((int(p[0]), int(p[2]), int(p[7]), int(p[8]), int(p[10]), p[11]))
         if len(cb) > 8:
-            for p in cb[8] or []:      # addUnifiedParameters: [key, conditionId, dur, num, skill, action, ability, product, group, from, ...]
+            for p in cb[8] or []:      # UnifiedParameterSyncData: [key, conditionId, dur, num, skill, action, ability, product, group, from, ...]
                 if isinstance(p, list) and len(p) >= 10:
-                    found.append((int(p[1]), int(p[6]), int(p[7]), int(p[8]), p[9]))
-        for cond, ability_id, product_id, group, frm in found:
+                    found.append((int(p[0]), int(p[1]), int(p[6]), int(p[7]), int(p[8]), p[9]))
+        for buff_key, cond, ability_id, product_id, group, frm in found:
             from_actor = int(frm[0]) if isinstance(frm, list) and frm else 0
             if from_actor == -1 or group == 3:
                 if cond in CLEANSE_SKIP_CONDITIONS:
                     continue
-                key = (tuple(character), cond)
-                if time.time() - self.cleanse_recent.get(key, 0) < 7.0:   # a volley is already in flight
-                    continue
-                self.cleanse_recent[key] = time.time()
-                # 2026-08-31 惡魔審判 finding (log-proven, 6 waves): one immediate reset strips enemy debuffs from
-                # the three AI units but never from the player-controlled lead unit — its removal only succeeds on a
-                # DELAYED retry (lead-unit removals landed at +1.2/+2.4/+2.7s = the 0.7s/2.0s repeats).
-                # 2026-09-01 party-switch finding: in phase 2 the CONTROLLED lead ([1,40]) refused every reset
-                # across two full volleys while AI units 41-43 accepted — the controlled unit's reset handler
-                # resolves by ACTIVE-party index, not roster index (heal/SP at 40+i work; reset 75 is a different
-                # path). So latter-party volleys are also sent aliased to [actor, i % 40] (a no-op on whichever
-                # interpretation is wrong), and the volley is longer to outlast refusal windows.
-                targets = [character]
+                # 2026-09-01 instrumented finding (wave table, session 61672): AI units accept the FIRST reset
+                # (+0.5 s); the player-CONTROLLED unit refuses resets for seconds at a time (up to the whole 6 s
+                # volley) and accepted once exactly on the +6 s shot. Open-loop volleys therefore give up too
+                # early. Closed loop instead: track each application by its buff KEY, retry every 1.5 s until the
+                # client broadcasts the key's removal (slot 9 unified / slot 3 plain), give up after 30 s.
+                targets = [list(character)]
                 if character[1] >= LATTER_PARTY_INDEX_OFFSET:
                     targets.append([character[0], character[1] % LATTER_PARTY_INDEX_OFFSET])
-                log(f"{self.tag()} CLEANSE: volley for condition {cond} on unit {character}"
+                now = time.time()
+                with self.lock:
+                    self.cleanse_pending[(tuple(character), cond)] = {
+                        "key": buff_key, "targets": targets, "cond": cond,
+                        "ability": ability_id, "product": product_id,
+                        "t0": now, "next": now, "until": now + 30.0, "sent": 0,
+                    }
+                log(f"{self.tag()} CLEANSE: tracking cond {cond} key {buff_key} on unit {character}"
                     + (f" (+alias {targets[1]})" if len(targets) > 1 else "")
-                    + " (sends at 0/0.7/1.5/2.5/4/6s)")
-                for t in targets:
-                    self.send_cleanse(t, cond, ability_id, product_id)
-                    for d in (0.7, 1.5, 2.5, 4.0, 6.0):
-                        threading.Timer(d, self.send_cleanse, args=(t, cond, ability_id, product_id)).start()
+                    + " — retry 1.5s until removal confirmed (30s cap)")
+                self.pump_cleanse()
+
+    def pump_cleanse(self):
+        """Send due pending cleanses; called on detection and every 0.5 s from cleanse_loop."""
+        now = time.time()
+        due = []
+        with self.lock:
+            for pkey, ent in list(self.cleanse_pending.items()):
+                if now >= ent["until"]:
+                    log(f"{self.tag()} CLEANSE GAVE UP: unit {list(pkey[0])} cond {pkey[1]} key {ent['key']} "
+                        f"after {ent['sent']} send(s) / {now - ent['t0']:.0f}s")
+                    del self.cleanse_pending[pkey]
+                    continue
+                if now >= ent["next"]:
+                    ent["next"] = now + 1.5
+                    ent["sent"] += len(ent["targets"])
+                    due.append((list(ent["targets"]), ent["cond"], ent["ability"], ent["product"]))
+        for targets, cond, ability, product in due:
+            for t in targets:
+                self.send_cleanse(t, cond, ability, product)
+
+    def cleanse_loop(self):
+        time.sleep(2.0)
+        while self.in_quest and self.state == "joined":
+            try:
+                self.pump_cleanse()
+            except Exception:
+                log(f"{self.tag()} cleanse pump error:\n{traceback.format_exc()}")
+            time.sleep(0.5)
+        with self.lock:
+            n = len(self.cleanse_pending)
+            self.cleanse_pending.clear()
+        log(f"{self.tag()} cleanse loop ended ({n} pending dropped)")
 
     def send_cleanse(self, character, cond, ability_id, product_id):
         if not self.in_quest:
@@ -947,6 +994,8 @@ class Peer:
     def reset_state_machine(self):
         self.min_state = 0
         self.hero = {}
+        with self.lock:
+            self.cleanse_pending.clear()
 
     def on_goto_ingame_state(self, actor, value):
         # single real actor: the minimum over actors is the value itself; the ghost mirrors the host
@@ -1034,9 +1083,12 @@ class Peer:
             log(f"{self.tag()} actor 1 ready -> StartQuest")
             self.raise_plugin_event(EV_START_QUEST, {})
             self.start_actor_count = 1
-            if (GODMODE or SPFILL) and not self.in_quest:      # the client sends Ready more than once; one loop per quest
+            if not self.in_quest:      # the client sends Ready more than once; one set of loops per quest
                 self.in_quest = True
-                threading.Thread(target=self.god_loop, daemon=True).start()
+                if GODMODE or SPFILL:
+                    threading.Thread(target=self.god_loop, daemon=True).start()
+                if CLEANSE:
+                    threading.Thread(target=self.cleanse_loop, daemon=True).start()
             self.in_quest = True
         elif code == EV_CLEAR_REQ:
             self.in_quest = False
