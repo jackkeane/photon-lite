@@ -86,7 +86,7 @@ verified on a real phone. Rooms with a second device are **not** implemented (se
 | `--cleanse` | off (on with `--godmode`) | remove conditions an enemy puts on your units — closed loop: each application is tracked by its sync key and the removal is retried every 1.5 s until the client confirms it, up to 30 s (see *Limits*) |
 | `--no-cleanse` | off | disable the cleanse even with `--godmode` (A/B testing) |
 | `--spfill` | off | refill every unit's skill gauges (SP) to 100 % once a second |
-| `--dragonfill` | off | **inert, kept for reference** — re-fires QUEST_START DpCharge, which the client only banks at quest start (see *Limits*) |
+| `--dragonfill` | off | **experimental, start-only** — fills the dragon gauge once at fight start (re-fires QUEST_START DpCharge); does nothing after that (see *Limits*) |
 | `--log-buffs` | off | decode-log every ChangeBuff event (multi-KB lines — heavy in busy fights) |
 
 ## Limits
@@ -101,8 +101,9 @@ verified on a real phone. Rooms with a second device are **not** implemented (se
   re-sending `TriggerAbility` QUEST_START does nothing after the fight starts, because the client only
   *banks* quest-start DpCharge values (`GameUserData.questStartChargeRate`) and cashes the bank once in
   `ApplyQuestStartChargeRate`. Verified 2026-09-02 on the wire (gauge 0 after every shapeshift while the
-  loop ran all fight) and in the client binary. `--dragonfill` is therefore inert and out of the launcher;
-  a real refill would need a client patch (`ConsumeDp` / `SetDp`) or a master-data edit.
+  loop ran all fight) and in the client binary. `--dragonfill` is therefore **experimental and start-only**:
+  it gives the fight-start fill and nothing else, so it is not in the launcher by default. A real mid-fight
+  refill would need a client patch (`ConsumeDp` / `SetDp`) or a master-data edit.
 * **`--cleanse` cannot clean the avatar you are playing in judgment-mechanic fights.** Established
   across many instrumented runs (Yaldabaoth's party-switch fight, Demonic Judgment): each time the
   boss applies the debuff, the three units you are *not* controlling are cleansed within half a

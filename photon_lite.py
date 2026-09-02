@@ -50,7 +50,7 @@ _ap.add_argument("--cleanse", action="store_true", help="remove every debuff an 
 _ap.add_argument("--no-cleanse", action="store_true", help="disable the cleanse even with --godmode (A/B testing)")
 _ap.add_argument("--log-buffs", action="store_true", help="decode-log every ChangeBuff event (multi-KB lines; off by default since 2026-08-31 — the writes stall the relay loop in busy fights)")
 _ap.add_argument("--spfill", action="store_true", help="refill every unit's skill gauges (SP) to 100%% once a second")
-_ap.add_argument("--dragonfill", action="store_true", help="INERT (2026-09-02, verified on the wire + in the client): re-fires QUEST_START DpCharge, which the client only banks at quest start. Kept for reference only")
+_ap.add_argument("--dragonfill", action="store_true", help="EXPERIMENTAL: fills the dragon gauge once at fight start (QUEST_START DpCharge); does nothing after that — the client banks quest-start DP once and no event can add DP later")
 _ap.add_argument("--cheat", type=float, default=1.0, help="(ineffective, kept for experiments) scale HeroParam hp/attack")
 _ap.add_argument("--log", default=os.path.join(HERE, "photon_lite.log"), help="log file")
 _ARGS = _ap.parse_args()
@@ -83,14 +83,16 @@ DP_HITATTR_INDEX = 7499
 # equipped QUEST_START (15) DpCharge / DpChargeMyParty rows (up to 50% of maxDp = both orbs).
 # HITCOUNT_MOMENT (21) DpCharge rows all have _ConditionValue 50-70 (every N hits, +3%) — the
 # TriggerAbility wire has no conditionValue field, so those never fire from this event.
-# 2026-09-02 VERDICT — DEAD. Log of the 09:22 run (226010101): DP 1000 at the real start, 0 after every
+# 2026-09-02 VERDICT — EXPERIMENTAL, START-ONLY (user: "it does fill one gauge at the beginning but nothing
+# else"). Log of the 09:22 run (226010101): DP 1000 at the real start, 0 after every
 # shapeshift, then only combat gains (+230 steps) while this loop sent QUEST_START 1/s the whole fight.
 # Client: CharacterManager.ActivateQuestStartAbility -> per-human CheckConditionallyAbility(QUEST_START)
 # only BANKS DpCharge values into GameUserData.questStartChargeRate (capped), and ApplyQuestStartChargeRate
 # (its only caller) cashes the bank ONCE, zeroes it and sets requestCapRate=-4. The start fill the user saw
 # is the party kit (涅帝爾 創世龍降臨 / 巴哈姆特 神擊咆哮: +50% at start, and shapeshift costs the WHOLE
 # gauge). All 21 QUEST_START DpCharge rows have OccurenceNum/MaxCount/CoolTime 0, so the one-shot is the
-# banking, not the ability. Removed from the launcher; flag left in for reference. Do not resurrect.
+# banking, not the ability. Out of the launcher by default (dead weight mid-fight); pass it by hand if the
+# start-of-fight fill is wanted. Do not try to turn it into a mid-fight pump.
 # Wire: [seq, condition, owner, from, target, actionId, skillId].
 EV_TRIGGER_ABILITY = 120
 ABILITY_CONDITION_QUEST_START = 15
