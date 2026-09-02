@@ -29,7 +29,7 @@ verified on a real phone. Rooms with a second device are **not** implemented (se
   host's whole party (`--fill`, default 4; Dawnshard's rule would be leader + 2 AI).
 * Optional cheats (server-injected events the owning client applies to its own units): `--godmode`
   (full heal 5×/s, a damage shield, 70/60/50 % damage-cut buffs and a debuff cleanse), `--atkbuff`
-  (+225 % attack, immune to Curse of Emptiness) and `--spfill` (every skill gauge refilled once a
+  (+225 % attack, immune to Curse of Emptiness), `--spfill` (every skill gauge refilled once a
   second, so skills are always ready). The cleanse is closed-loop: each enemy debuff is tracked by its
   sync key and the removal request is repeated every 1.5 s until the client broadcasts that the buff is
   gone (30 s cap). See *Limits* for the one debuff it cannot remove.
@@ -62,7 +62,7 @@ verified on a real phone. Rooms with a second device are **not** implemented (se
 
    ```
    python photon_lite.py --lan-ip 192.168.1.10
-   python photon_lite.py --lan-ip 192.168.1.10 --godmode --atkbuff --spfill   # with the cheats
+   python photon_lite.py --lan-ip 192.168.1.10 --godmode --atkbuff --spfill --dragonfill   # with the cheats
    ```
 
    `--lan-ip` is what the game-server redirect hands to the phone; omit it to auto-detect.
@@ -86,6 +86,7 @@ verified on a real phone. Rooms with a second device are **not** implemented (se
 | `--cleanse` | off (on with `--godmode`) | remove conditions an enemy puts on your units — closed loop: each application is tracked by its sync key and the removal is retried every 1.5 s until the client confirms it, up to 30 s (see *Limits*) |
 | `--no-cleanse` | off | disable the cleanse even with `--godmode` (A/B testing) |
 | `--spfill` | off | refill every unit's skill gauges (SP) to 100 % once a second |
+| `--dragonfill` | off | **inert, kept for reference** — re-fires QUEST_START DpCharge, which the client only banks at quest start (see *Limits*) |
 | `--log-buffs` | off | decode-log every ChangeBuff event (multi-KB lines — heavy in busy fights) |
 
 ## Limits
@@ -95,6 +96,13 @@ verified on a real phone. Rooms with a second device are **not** implemented (se
 * `--godmode` refills HP, it does not make units invulnerable: a hit larger than max HP or a rare
   multi-hit chain can still kill. Auto-revive only works in quests whose `_RebornLimit` allows revives
   (normal co-op quests do; most raids don't).
+* **The dragon gauge cannot be refilled from the server.** There is no DP request event; heals
+  (`RecoveryHpRequest`) never touch the gauge; `DragonGauge` (61) only updates other players' UI; and
+  re-sending `TriggerAbility` QUEST_START does nothing after the fight starts, because the client only
+  *banks* quest-start DpCharge values (`GameUserData.questStartChargeRate`) and cashes the bank once in
+  `ApplyQuestStartChargeRate`. Verified 2026-09-02 on the wire (gauge 0 after every shapeshift while the
+  loop ran all fight) and in the client binary. `--dragonfill` is therefore inert and out of the launcher;
+  a real refill would need a client patch (`ConsumeDp` / `SetDp`) or a master-data edit.
 * **`--cleanse` cannot clean the avatar you are playing in judgment-mechanic fights.** Established
   across many instrumented runs (Yaldabaoth's party-switch fight, Demonic Judgment): each time the
   boss applies the debuff, the three units you are *not* controlling are cleansed within half a

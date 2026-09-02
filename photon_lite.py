@@ -7,7 +7,7 @@ ports the plugin's room logic (GoToIngameState 1-4, heroparam/batch, Party/Chara
 ClearQuestRequest->dungeon_record/record_multi) plus the State-Manager HTTP API the Dawnshard container queries.
 
     python photon_lite.py --lan-ip 192.168.1.10 [--api http://127.0.0.1:5000] [--token photon-lite-token]
-                          [--godmode] [--atkbuff] [--fill 4] [--no-ghost] [--port 5055] [--state-port 5057]
+                          [--godmode] [--atkbuff] [--spfill] [--dragonfill] [--fill 4] [--no-ghost] [--port 5055] [--state-port 5057]
 
 Dawnshard (docker-compose environment):
     PhotonOptions__ServerUrl=<lan-ip>:5055
@@ -50,6 +50,7 @@ _ap.add_argument("--cleanse", action="store_true", help="remove every debuff an 
 _ap.add_argument("--no-cleanse", action="store_true", help="disable the cleanse even with --godmode (A/B testing)")
 _ap.add_argument("--log-buffs", action="store_true", help="decode-log every ChangeBuff event (multi-KB lines; off by default since 2026-08-31 — the writes stall the relay loop in busy fights)")
 _ap.add_argument("--spfill", action="store_true", help="refill every unit's skill gauges (SP) to 100%% once a second")
+_ap.add_argument("--dragonfill", action="store_true", help="INERT (2026-09-02, verified on the wire + in the client): re-fires QUEST_START DpCharge, which the client only banks at quest start. Kept for reference only")
 _ap.add_argument("--cheat", type=float, default=1.0, help="(ineffective, kept for experiments) scale HeroParam hp/attack")
 _ap.add_argument("--log", default=os.path.join(HERE, "photon_lite.log"), help="log file")
 _ARGS = _ap.parse_args()
@@ -67,12 +68,33 @@ GHOST_ACTOR = 2
 GODMODE = _ARGS.godmode
 GOD_INTERVAL = 0.2
 HEAL_HITATTR_INDEX = 226   # BUF_127_HEAL_LV01 -- index into the 2.19.0 client's PlayerActionHitAttribute master list
-SHIELD_HITATTR_INDEX = 8252  # S169_001_02_LV02 -> ActionCondition 2065: damage shield 100% max HP (2 charges)
-BUFF_PERIOD = 2.0            # how often each unit's shield/cut/attack-buff volley refreshes (staggered, one unit per tick)
-BUFF_HITATTR_INDEXES = [SHIELD_HITATTR_INDEX, 439, 438, 5567, 5566]   # 70%/70%/60%/50% damage-cut buffs
-# Dragon-gauge refill: S053_001_DPC_LV02 (index 7499) = +20% dragon points to self each application, so a boss that
-# drains the gauge (Diabolos 背德祝福) cannot keep the party from shapeshifting. Applied with the buffs every second.
+SHIELD_HITATTR_INDEX = 8252  # S169_001_02_LV02 -> ActionCondition 2065: damage shield 100% max HP (2 charges), curse-immune
+# Surtr Legend (232030101): unit [1,1] died in 5/6 runs through this shield-on-2s cadence. 2065 is the strongest
+# shield in master data (only DurationNum=2 / RateDamageShield3=1 row). Refresh it with the heal, not the 2s volley.
+BUFF_PERIOD = 2.0            # how often each unit's damage-cut / attack-buff volley refreshes (staggered, one unit per tick)
+BUFF_HITATTR_INDEXES = [439, 438, 5567, 5566]   # 70%/70%/60%/50% damage-cut buffs (shield is on the heal tick)
+# Dragon-gauge refill on the godmode buff volley: S053_001_DPC_LV02 (7499) = +20% DP on a HEAL hitattr.
+# RecoveryHpRequest runs OnCollided → ProcedureHeal, which never calls GameUserData.RecoveryDp, so this
+# does NOT fill the bar (user-confirmed; one orb that filled was combat DP). Kept on the 2s volley anyway.
 DP_HITATTR_INDEX = 7499
+# --dragonfill: TriggerAbility (120). There is no RecoveryDpRequest. Event 61 only writes other players'
+# UI (PlayerEventReceiver.LastDp). GameUserData.maxDp = 2 * consumeDp (two orbs); RecoveryDp is only
+# called from Ability.ApplyDpCharge. TriggerAbility is owner-applied (no receiver check): it re-fires
+# equipped QUEST_START (15) DpCharge / DpChargeMyParty rows (up to 50% of maxDp = both orbs).
+# HITCOUNT_MOMENT (21) DpCharge rows all have _ConditionValue 50-70 (every N hits, +3%) — the
+# TriggerAbility wire has no conditionValue field, so those never fire from this event.
+# 2026-09-02 VERDICT — DEAD. Log of the 09:22 run (226010101): DP 1000 at the real start, 0 after every
+# shapeshift, then only combat gains (+230 steps) while this loop sent QUEST_START 1/s the whole fight.
+# Client: CharacterManager.ActivateQuestStartAbility -> per-human CheckConditionallyAbility(QUEST_START)
+# only BANKS DpCharge values into GameUserData.questStartChargeRate (capped), and ApplyQuestStartChargeRate
+# (its only caller) cashes the bank ONCE, zeroes it and sets requestCapRate=-4. The start fill the user saw
+# is the party kit (涅帝爾 創世龍降臨 / 巴哈姆特 神擊咆哮: +50% at start, and shapeshift costs the WHOLE
+# gauge). All 21 QUEST_START DpCharge rows have OccurenceNum/MaxCount/CoolTime 0, so the one-shot is the
+# banking, not the ability. Removed from the launcher; flag left in for reference. Do not resurrect.
+# Wire: [seq, condition, owner, from, target, actionId, skillId].
+EV_TRIGGER_ABILITY = 120
+ABILITY_CONDITION_QUEST_START = 15
+ABILITY_CONDITION_HITCOUNT_MOMENT = 21  # kept as a named constant; not sent for --dragonfill
 # +100/+50/+50/+15/+10% attack, all _CurseOfEmptinessInvalid. NEVER add rows whose ActionCondition carries
 # _EnhancedSkill*/_EnhancedBurstAttack (e.g. condition 853): they replace the units' skills and freeze the game.
 ATK_BUFF_HITATTR_INDEXES = [6579, 5408, 73, 8608, 5458] if _ARGS.atkbuff else []
@@ -88,6 +110,8 @@ EV_RECOVERY_HP_REQUEST = 76
 SPFILL = _ARGS.spfill
 EV_RECOVERY_SP_REQUEST = 74
 SP_INTERVAL = 1.0
+DRAGONFILL = _ARGS.dragonfill
+DP_INTERVAL = 1.0   # QUEST_START once a second, staggered — same event budget as --spfill. 0.2s × 8 × 2 broke heals.
 # Party-switch quests: the second team's units are CharacterId index 40+i (client CharacterId.LatterPartyIndexOffset = 40;
 # ServantIndexOffset 20, GuestPlayerIndexOffset 100). Every per-unit cheat targets all parties, or team 2 gets nothing.
 LATTER_PARTY_INDEX_OFFSET = 40
@@ -110,7 +134,12 @@ EV_RESET_BUFF_REQUEST = 75
 # of each entry, reason 0xff passes ProcessScaledBuffOnRemoveForReason) and the send envelope is identical to
 # the working god-mode heals — yet the user observes 1989 sticking and stacking in this fight. Ground truth
 # needed from a live run with buff logging before any further theory.
-CLEANSE_SKIP_CONDITIONS = {1599, 1671}
+# 2182 穆斯貝爾熱害 (Múspell's Heatblight): USER-CONFIRMED 2026-09-01 — ResetBuffRequest never
+# actually strips the icon. The Flame adds re-apply it in the same ChangeBuff as our reason-255
+# remove; the only real clear is killing the two Múspell's Flame ("fire mountain") adds. Skipping
+# it stops the useless 0.5s barrage that was also chewing the relay during Surtr.
+CLEANSE_SKIP_CONDITIONS = {1599, 1671, 2182}
+CLEANSE_RETRY_SEC = 1.5
 # Party-switch quests: at each phase the host raises GameStepEvent (96, [seq, step]) and MultiPlayWaitingList
 # .StartWaitForAllOthers waits for the same step from every other actor (PartySwitchTimeout after ~10 s otherwise).
 # The ghost echoes each step as its own event (sender = ghost actor).
@@ -137,6 +166,7 @@ EV_READY, EV_CHARACTER_DATA, EV_START_QUEST, EV_ROOM_BROKEN, EV_GAME_SUCCEED = 0
 EV_PARTY, EV_CLEAR_REQ, EV_CLEAR_RESP, EV_FAIL_REQ, EV_FAIL_RESP, EV_DEAD = 0x3E, 0x3F, 0x40, 0x43, 0x44, 0x48
 EV_NAMES = {3: "Ready", 0x14: "CharacterData", 0x15: "StartQuest", 0x17: "RoomBroken", 0x18: "GameSucceed", 0x3E: "Party",
             27: "RebornEvent", 76: "RecoveryHpRequest", 61: "DragonGauge", 71: "EnemyAbility", 50: "ChangeBuff", 75: "ResetBuffRequest",
+            120: "TriggerAbility",
             0x3F: "ClearQuestRequest", 0x40: "ClearQuestResponse", 0x43: "FailQuestRequest", 0x44: "FailQuestResponse",
             0x48: "Dead", 253: "PropertiesChanged", 255: "Join", 254: "Leave"}
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -541,7 +571,7 @@ class Peer:
 
     def send_event(self, evcode, params):
         body = bytes([evcode]) + params_encode(params)
-        if evcode not in (EV_RECOVERY_HP_REQUEST, EV_RECOVERY_SP_REQUEST, EV_RESET_BUFF_REQUEST):   # god-mode/cleanse loops are too chatty to log every send
+        if evcode not in (EV_RECOVERY_HP_REQUEST, EV_RECOVERY_SP_REQUEST, EV_RESET_BUFF_REQUEST, EV_TRIGGER_ABILITY):   # god-mode/cleanse loops are too chatty to log every send
             log(f"{self.tag()} <- Event {evcode} {fmt_params(params)}")
         self.send_reliable(0, b"\xf3\x04" + body)
 
@@ -795,8 +825,17 @@ class Peer:
         character = [int(cb[1][0]), int(cb[1][1])]
         if character[0] != 1:
             return
-        # --- confirmation: the client broadcasts every removal (plain slot 3, unified slot 9) with the buff KEY;
-        # a removal (any reason) of a tracked key means the debuff is gone — stop retrying.
+        found = []
+        for p in cb[2] or []:          # ParameterSyncData: [key, type, conditionId, dur, num, skill, action, ability, product, rate, group, from, ...]
+            if isinstance(p, list) and len(p) >= 12:
+                found.append((int(p[0]), int(p[2]), int(p[7]), int(p[8]), int(p[10]), p[11]))
+        if len(cb) > 8:
+            for p in cb[8] or []:      # UnifiedParameterSyncData: [key, conditionId, dur, num, skill, action, ability, product, group, from, ...]
+                if isinstance(p, list) and len(p) >= 10:
+                    found.append((int(p[0]), int(p[1]), int(p[6]), int(p[7]), int(p[8]), p[9]))
+        # --- confirmation: the client broadcasts every removal (plain slot 3, unified slot 9) with the buff KEY.
+        # Track a SET of keys per (unit, cond): Surtr 402010301 leftover-pile-up overwrote the single
+        # stored key on each re-apply, so later removals never matched and pending never cleared.
         removes = []
         for slot in (3, 9):
             if len(cb) > slot:
@@ -807,19 +846,12 @@ class Peer:
             with self.lock:
                 for pkey, ent in list(self.cleanse_pending.items()):
                     if pkey[0] == tuple(character):
-                        hit = [r for r in removes if r[0] == ent["key"]]
+                        tracked = ent.get("keys") or {ent["key"]}
+                        hit = [r for r in removes if r[0] in tracked]
                         if hit:
-                            log(f"{self.tag()} CLEANSE CONFIRMED: unit {character} cond {pkey[1]} key {ent['key']} "
+                            log(f"{self.tag()} CLEANSE CONFIRMED: unit {character} cond {pkey[1]} key {hit[0][0]} "
                                 f"removed reason {hit[0][1]} after {time.time() - ent['t0']:.1f}s ({ent['sent']} send(s))")
                             del self.cleanse_pending[pkey]
-        found = []
-        for p in cb[2] or []:          # ParameterSyncData: [key, type, conditionId, dur, num, skill, action, ability, product, rate, group, from, ...]
-            if isinstance(p, list) and len(p) >= 12:
-                found.append((int(p[0]), int(p[2]), int(p[7]), int(p[8]), int(p[10]), p[11]))
-        if len(cb) > 8:
-            for p in cb[8] or []:      # UnifiedParameterSyncData: [key, conditionId, dur, num, skill, action, ability, product, group, from, ...]
-                if isinstance(p, list) and len(p) >= 10:
-                    found.append((int(p[0]), int(p[1]), int(p[6]), int(p[7]), int(p[8]), p[9]))
         for buff_key, cond, ability_id, product_id, group, frm in found:
             from_actor = int(frm[0]) if isinstance(frm, list) and frm else 0
             if from_actor == -1 or group == 3:
@@ -850,11 +882,22 @@ class Peer:
                 # still catch momentary refusals; full removal on the affected unit is out of reach via 75.
                 now = time.time()
                 with self.lock:
-                    self.cleanse_pending[(tuple(character), cond)] = {
-                        "key": buff_key, "targets": targets, "cond": cond,
-                        "ability": ability_id, "product": product_id,
-                        "t0": now, "next": now, "until": now + 30.0, "sent": 0,
-                    }
+                    pkey = (tuple(character), cond)
+                    ent = self.cleanse_pending.get(pkey)
+                    if ent is None:
+                        self.cleanse_pending[pkey] = {
+                            "key": buff_key, "keys": {buff_key}, "targets": targets, "cond": cond,
+                            "ability": ability_id, "product": product_id,
+                            "t0": now, "next": now, "until": now + 30.0, "sent": 0,
+                        }
+                    else:
+                        ent["keys"].add(buff_key)
+                        ent["key"] = buff_key
+                        ent["targets"] = targets
+                        ent["ability"] = ability_id
+                        ent["product"] = product_id
+                        ent["next"] = now
+                        ent["until"] = now + 30.0
                 log(f"{self.tag()} CLEANSE: tracking cond {cond} key {buff_key} on unit {character}"
                     + (f" (+alias {targets[1]})" if len(targets) > 1 else "")
                     + " — retry 1.5s until removal confirmed (30s cap)")
@@ -872,7 +915,7 @@ class Peer:
                     del self.cleanse_pending[pkey]
                     continue
                 if now >= ent["next"]:
-                    ent["next"] = now + 1.5
+                    ent["next"] = now + CLEANSE_RETRY_SEC
                     ent["sent"] += len(ent["targets"])
                     due.append((list(ent["targets"]), ent["cond"], ent["ability"], ent["product"]))
         for targets, cond, ability, product in due:
@@ -907,8 +950,8 @@ class Peer:
         self.raise_plugin_event(EV_REBORN, evt)
 
     def god_loop(self):
-        """--godmode / --spfill: keep every host unit at full HP (RecoveryHpRequest) and/or full SP (RecoverySpRequest);
-        the owning client applies both to the units it owns."""
+        """--godmode / --spfill / --dragonfill: keep every host unit at full HP / SP / dragon gauge;
+        the owning client applies RecoveryHpRequest and RecoverySpRequest to the units it owns."""
         time.sleep(4.0)  # let the units spawn
         units = self.used_member_count(1) or 1
         parties = max(1, max((len(h["lists"]) for h in self.hero.values()), default=1))
@@ -917,6 +960,8 @@ class Peer:
             log(f"{self.tag()} GODMODE: healing units {targets} every {GOD_INTERVAL}s (hitattr index {HEAL_HITATTR_INDEX})")
         if SPFILL:
             log(f"{self.tag()} SPFILL: refilling every skill of units {targets} every {SP_INTERVAL}s")
+        if DRAGONFILL:
+            log(f"{self.tag()} DRAGONFILL: TriggerAbility QUEST_START on units {targets} every {DP_INTERVAL}s")
         n = 0
         # 2026-08-31 slowdown fix: the old loop fired every unit's full volley in the same tick — with 8 slots
         # (party-switch quests) that was ~120 reliable events in one burst every second, ~144/s sustained, and the
@@ -925,17 +970,30 @@ class Peer:
         # per tick), SP refills spread over the second. ~80 events/s, peak burst ~20.
         buff_ticks = max(1, int(round(BUFF_PERIOD / GOD_INTERVAL)))
         sp_every = max(1, int(round(SP_INTERVAL / GOD_INTERVAL)))
+        dp_every = max(1, int(round(DP_INTERVAL / GOD_INTERVAL)))
         nt = len(targets)
+        if DRAGONFILL:
+            try:
+                for i in targets:
+                    ch = [1, i]
+                    evt = [self.next_ev_seq(EV_TRIGGER_ABILITY), ABILITY_CONDITION_QUEST_START, ch, ch, ch, 0, 0]
+                    self.send_event(EV_TRIGGER_ABILITY, {245: mp_pack(evt), 254: 0})
+            except Exception:  # noqa: BLE001
+                log(f"{self.tag()} DRAGONFILL QUEST_START send error:\n{traceback.format_exc()}")
         while self.in_quest and self.state in ("joined",) and n < 7200:
             for k, i in enumerate(targets):
                 try:
                     if GODMODE:
                         # RecoveryHpRequest: [seq, character[actorId,index], from[actorId,index], healValue, characterType,
                         #                     elementIndex, actionId, productId, bulletId, skillId, followerAvoid]
-                        if (n + k) % 2 == 0:   # each unit every 0.4s; the shield + damage cuts cover the gap
-                            evt = [self.next_ev_seq(EV_RECOVERY_HP_REQUEST), [1, i], [1, i], 999999, 0, HEAL_HITATTR_INDEX, 0, 0, 0, 0, 0]
+                        # Heal every 0.2s (was 0.4s). Surtr Legend one-shots through a 0.4s gap; 232030101
+                        # _RebornLimit=0 so a failed absorb is a wipe, not a downed-wait.
+                        evt = [self.next_ev_seq(EV_RECOVERY_HP_REQUEST), [1, i], [1, i], 999999, 0, HEAL_HITATTR_INDEX, 0, 0, 0, 0, 0]
+                        self.send_event(EV_RECOVERY_HP_REQUEST, {245: mp_pack(evt), 254: 0})
+                        if (n + k) % 2 == 0:   # 2-charge 100% shield every 0.4s (was buried in the 2s volley)
+                            evt = [self.next_ev_seq(EV_RECOVERY_HP_REQUEST), [1, i], [1, i], 1, 0, SHIELD_HITATTR_INDEX, 0, 0, 0, 0, 0]
                             self.send_event(EV_RECOVERY_HP_REQUEST, {245: mp_pack(evt), 254: 0})
-                        if n % buff_ticks == (k * buff_ticks) // nt:   # shield + damage-cut + attack buffs, one unit's volley per tick
+                        if n % buff_ticks == (k * buff_ticks) // nt:   # damage-cut + attack buffs, one unit's volley per tick
                             for idx in BUFF_HITATTR_INDEXES + ATK_BUFF_HITATTR_INDEXES + [DP_HITATTR_INDEX]:
                                 evt = [self.next_ev_seq(EV_RECOVERY_HP_REQUEST), [1, i], [1, i], 1, 0, idx, 0, 0, 0, 0, 0]
                                 self.send_event(EV_RECOVERY_HP_REQUEST, {245: mp_pack(evt), 254: 0})
@@ -946,11 +1004,15 @@ class Peer:
                         self.send_event(EV_RECOVERY_SP_REQUEST, {245: mp_pack(evt), 254: 0})
                         evt = [self.next_ev_seq(EV_RECOVERY_SP_REQUEST), [1, i], 0.0, 0, False, 99999, False]
                         self.send_event(EV_RECOVERY_SP_REQUEST, {245: mp_pack(evt), 254: 0})
+                    if DRAGONFILL and n % dp_every == k % dp_every:
+                        ch = [1, i]
+                        evt = [self.next_ev_seq(EV_TRIGGER_ABILITY), ABILITY_CONDITION_QUEST_START, ch, ch, ch, 0, 0]
+                        self.send_event(EV_TRIGGER_ABILITY, {245: mp_pack(evt), 254: 0})
                 except Exception:  # noqa: BLE001
                     log(f"{self.tag()} godmode send error:\n{traceback.format_exc()}"); return
             n += 1
             time.sleep(GOD_INTERVAL)
-        log(f"{self.tag()} GODMODE/SPFILL loop ended (in_quest={self.in_quest}, state={self.state}, ticks={n})")
+        log(f"{self.tag()} GODMODE/SPFILL/DRAGONFILL loop ended (in_quest={self.in_quest}, state={self.state}, ticks={n})")
 
     def quest_id(self):
         return int(self.game_props.get("C0", 0))
@@ -1097,7 +1159,7 @@ class Peer:
             self.start_actor_count = 1
             if not self.in_quest:      # the client sends Ready more than once; one set of loops per quest
                 self.in_quest = True
-                if GODMODE or SPFILL:
+                if GODMODE or SPFILL or DRAGONFILL:
                     threading.Thread(target=self.god_loop, daemon=True).start()
                 if CLEANSE:
                     threading.Thread(target=self.cleanse_loop, daemon=True).start()
@@ -1163,13 +1225,16 @@ class Peer:
                     log(f"{self.tag()} GameStepEvent echo error:\n{traceback.format_exc()}")
         elif code == EV_DEAD:
             self.dead.add(1)
+            target = None
+            try:
+                d = mp_unpack(data)          # Dead: [seq, character[actorId, index], popCount]
+                log(f"{self.tag()} Dead: {d}")
+                target = d[1] if isinstance(d, list) and len(d) > 1 else None
+            except Exception:  # noqa: BLE001
+                log(f"{self.tag()} Dead parse error:\n{traceback.format_exc()}")
             if GODMODE and self.in_quest:
-                try:
-                    d = mp_unpack(data)          # Dead: [seq, character[actorId, index], popCount]
-                    target = d[1] if isinstance(d, list) and len(d) > 1 else None
-                except Exception:  # noqa: BLE001
-                    target = None
                 if isinstance(target, list) and len(target) >= 2 and int(target[0]) == 1:   # own units only, not enemies
+                    # Legend 厄魔 (_RebornLimit 0) will ignore this; still send so quests that allow revives recover.
                     threading.Timer(REBORN_DELAY, self.send_reborn, args=([list(target[:2])],)).start()
         elif code == EV_REBORN and GODMODE and self.in_quest:
             try:
